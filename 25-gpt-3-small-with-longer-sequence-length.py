@@ -1677,7 +1677,7 @@ if master_process:
 train_val_margin = 0.03
 allow_val = False
 
-sample_interval = 4000
+sample_interval = 40
 sample_sequences = [
     "The universe has always been",
     "Who am I? I am a language model",
@@ -1689,7 +1689,7 @@ sample_sequences = [
     "Could you tell me what time it is?"
 ]
 
-hellaswag_interval = float('inf')
+hellaswag_interval = 50
 
 # checkpoint_interval = 1000
 max_checkpoints_to_keep = -1

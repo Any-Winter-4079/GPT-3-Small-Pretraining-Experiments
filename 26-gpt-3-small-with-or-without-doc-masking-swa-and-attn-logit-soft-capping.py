@@ -20,7 +20,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 27-gpt-3-small-26-but-faster.py
+# torchrun --standalone --nproc_per_node=4 26-gpt-3-small-with-or-without-doc-masking-swa-and-attn-logit-soft-capping.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -28,7 +28,7 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask,
 ################################################
 
 ################################################
-#                  GPTConfig                   #
+#                   GPT Config                 #
 ################################################
 @dataclass
 class GPTConfig:
@@ -573,7 +573,7 @@ class DataLoader:
         # a full mini-step is to be done after this
         self.grad_accum_mini_steps_per_shard_counter += 1
         return x, y, doc_ids
-    
+
 ################################################
 #                QK Norm Debug                 #
 ################################################
@@ -1107,7 +1107,6 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
         # get a length cap to pre-allocate the tensor while not needing to go to max_seq_len
         alloc_len = max_input_len + max_new_tokens
 
-        # rounding up to a nice multiple for better tensor cores / GPU efficiency
         # rounding up to a nice multiple for better tensor cores / GPU efficiency
         round_multiple = 128 if raw_gpt_model.use_flex_attention else 8
         alloc_len = math.ceil(alloc_len / round_multiple) * round_multiple
