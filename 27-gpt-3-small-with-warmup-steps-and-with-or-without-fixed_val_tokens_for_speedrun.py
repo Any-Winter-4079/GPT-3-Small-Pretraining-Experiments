@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import copy
 import math
 import time
 import torch
@@ -20,7 +21,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 26-gpt-3-small-with-or-without-doc-masking-swa-and-attn-logit-soft-capping.py
+# torchrun --standalone --nproc_per_node=4 27-gpt-3-small-with-warmup-steps-and-with-or-without-fixed_val_tokens_for_speedrun.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -91,7 +92,7 @@ class GPTConfig:
     use_doc_masking: bool = True
     use_sliding_window_attention: bool = True # True for Sliding Window (local) Attention (e.g., Mistral-style)
     sliding_window_size: int = 1024 # number of most-recent tokens a query can attend to (only used if use_sliding_window_attention=True)
-    use_attn_logit_softcapping: bool = True # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
+    use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
     attn_logit_softcap: float = 15.0
     tanh_backend: str = "ptx" # "clamp", "ptx" (faster) or "rational" or "exact"
 
@@ -401,7 +402,8 @@ class Muon(torch.optim.Optimizer):
 class DataLoader:
     def __init__(self, gpu_batch_size, seq_len, ddp_world_size, ddp_rank, data_folder, split="train", 
                  epoch=0, current_shard_idx=0, grad_accum_mini_steps_per_shard_counter=0,
-                 pad_token_id=50257, eos_token_id=50256, return_document_ids=False):
+                 pad_token_id=50257, eos_token_id=50256, return_document_ids=False,
+                 shuffle_val_tokens=True):
         # batch size each gpu can fit in
         self.gpu_batch_size = gpu_batch_size
         # seq len for each gpu
@@ -415,6 +417,7 @@ class DataLoader:
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
         self.return_document_ids = return_document_ids
+        self.shuffle_val_tokens = shuffle_val_tokens
 
         shards = os.listdir(data_folder)
         shards = [shard for shard in shards if split in shard]
@@ -481,11 +484,14 @@ class DataLoader:
             log_buffer.append(message)
     
     def _shuffle_shard(self):
-        g = torch.Generator()
-        g.manual_seed(self.current_shard_idx + self.epoch)
-        # e.g., [0, 2048, 11264, 10240, 4096, 9216, 1024, 5120, 6144, 8192, 3072, 7168]
-        shuffled_indices = torch.randperm(len(self.x_seq_starts), generator=g).tolist()
-        self.x_seq_starts = [self.x_seq_starts[i] for i in shuffled_indices]
+        if self.split == "train" or (self.split == "val" and self.shuffle_val_tokens):
+            g = torch.Generator()
+            g.manual_seed(self.current_shard_idx + self.epoch)
+            # e.g., [0, 2048, 11264, 10240, 4096, 9216, 1024, 5120, 6144, 8192, 3072, 7168]
+            shuffled_indices = torch.randperm(len(self.x_seq_starts), generator=g).tolist()
+            self.x_seq_starts = [self.x_seq_starts[i] for i in shuffled_indices]
+        # else: keep original order for validation (global prefix)
+
         # e.g., 12 * 0 / 2 = 0 for gpu0, 12 * 1 / 2 = 6 for gpu 1
         gpu_x_seq_start_idx = len(self.x_seq_starts) * self.ddp_global_rank // self.ddp_world_size
         # e.g., 0 + 12 / 2 = 6 for gpu0, 6 + 12 / 2 = 12 for gpu 1
@@ -493,6 +499,7 @@ class DataLoader:
         # e.g., [0, 2048, 11264, 10240, 4096, 9216] for gpu 0
         # [1024, 5120, 6144, 8192, 3072, 7168] for gpu 1
         self.gpu_x_seq_starts = self.x_seq_starts[gpu_x_seq_start_idx:gpu_x_seq_end_idx]
+
 
     def _start_shard_prefetch(self):
         # prefetch the next shard if not already running
@@ -553,13 +560,21 @@ class DataLoader:
             self._shuffle_shard()
             # immediately prefetch the following shard
             self._start_shard_prefetch()
-        # e.g., 0 for the 1st grad accum mini-step, gpu_batch_size for the 2nd grad accum mini-step, etc.
-        i = self.grad_accum_mini_steps_per_shard_counter * self.gpu_batch_size
-        # e.g., for gpu 0: [0, 2048] for the 1st grad accum mini-step, [11264, 10240] for the 2nd grad accum mini-step, etc.
-        #       for gpu 1: [1024, 5120] for the 1st grad accum mini-step, [6144, 8192] for the 2nd grad accum mini-step, etc.
-        batch_starts = self.gpu_x_seq_starts[i:i + self.gpu_batch_size]
-        # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
-        #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+        
+        if (self.split == "val") and (not self.shuffle_val_tokens):
+            # global, ordered prefix partitioning across ranks
+            global_batch_start = self.grad_accum_mini_steps_per_shard_counter * self.ddp_world_size * self.gpu_batch_size
+            start = global_batch_start + self.ddp_global_rank * self.gpu_batch_size
+            batch_starts = self.x_seq_starts[start:start + self.gpu_batch_size]
+        else:
+            # e.g., 0 for the 1st grad accum mini-step, gpu_batch_size for the 2nd grad accum mini-step, etc.
+            i = self.grad_accum_mini_steps_per_shard_counter * self.gpu_batch_size
+            # e.g., for gpu 0: [0, 2048] for the 1st grad accum mini-step, [11264, 10240] for the 2nd grad accum mini-step, etc.
+            #       for gpu 1: [1024, 5120] for the 1st grad accum mini-step, [6144, 8192] for the 2nd grad accum mini-step, etc.
+            batch_starts = self.gpu_x_seq_starts[i:i + self.gpu_batch_size]
+            # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
+            #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+
         x = torch.stack([self.tokens[start:start + self.seq_len] for start in batch_starts])
         y = torch.stack([self.tokens[start + 1:start + self.seq_len + 1] for start in batch_starts])
 
@@ -1975,6 +1990,8 @@ else:
 #             DataLoader Building              #
 ################################################
 data_path = "./data/edu_fineweb10B"
+# shuffle or first 10_485_760 tokens of the FineWeb validation shard for the NanoGPT Speedrun
+shuffle_val_tokens = True
 # if resume_from_checkpoint: epoch, current_shard_idx, and grad_accum_mini_steps_per_shard_counter are overriden
 # above and thus set to non-zero values in the DataLoader()
 train_data_loader = DataLoader(
@@ -1989,6 +2006,7 @@ val_data_loader = DataLoader(
     epoch=0, current_shard_idx=0, grad_accum_mini_steps_per_shard_counter=0,
     pad_token_id=model_cfg.pad_token_id, eos_token_id=model_cfg.eos_token_id,
     return_document_ids=raw_gpt_model.use_doc_masking,
+    shuffle_val_tokens=shuffle_val_tokens,
 )
 
 ################################################
@@ -2051,6 +2069,7 @@ def save_config_info():
         f.write(f"device type: {device_type}\n")
         f.write(f"tokenizer: gpt2 (tiktoken)\n")
 
+        f.write(f"shuffle val tokens: {shuffle_val_tokens}\n")
         f.write(f"val target: {val_target}\n")
         f.write(f"val steps: {val_steps}\n")
         f.write(f"val interval: {val_interval}\n")
@@ -2071,6 +2090,104 @@ if master_process:
     message = f"{sum(p.numel() for p in gpt_model.parameters() if p.requires_grad):,} parameters"
     print(message)
     log_buffer.append(message)
+
+################################################
+#                Kernel Warmup                 #
+################################################
+def _kernel_warmup(num_train_steps=2):
+    # snapshot everything so we don't "cheat"
+    model_state = copy.deepcopy(raw_gpt_model.state_dict())
+    optimizer_states = {k: copy.deepcopy(opt.state_dict()) for k, opt in optimizers.items()}
+    rng_state_cpu = torch.get_rng_state()
+    rng_state_cuda = torch.cuda.get_rng_state()
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # train-shape warmup (compile both DDP graphs)
+    gpt_model.train()
+    with torch.enable_grad():
+        for _ in range(num_train_steps):
+            for optimizer in optimizers.values():
+                optimizer.zero_grad(set_to_none=True)
+
+            for mini_step in range(grad_accum_mini_steps):
+                # mimic the real training loop’s DDP behavior
+                gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
+
+                # make shapes match training
+                x_train = torch.randint(
+                    0, raw_gpt_model.pad_token_id,
+                    (gpu_batch_size_train, seq_len_train), device=device
+                )
+                y_train = torch.randint(
+                    0, raw_gpt_model.pad_token_id,
+                    (gpu_batch_size_train, seq_len_train), device=device
+                )
+
+                # synthesize doc_ids so the doc-masking + SWA FlexAttention path compiles
+                if raw_gpt_model.use_doc_masking:
+                    # set random-ish EOS boundaries
+                    step = max(16, seq_len_train // 8)
+                    idxs = torch.arange(seq_len_train, device=device)[None, :]
+                    rand_offsets = torch.randint(0, step, (gpu_batch_size_train, 1), device=device)
+                    is_eos = ((idxs + rand_offsets) % step == 0)
+                    doc_ids_train = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+                else:
+                    doc_ids_train = None
+
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    _, warm_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+
+                (warm_loss / grad_accum_mini_steps).backward()
+
+            for optimizer in optimizers.values():
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # val-shape warmup (compile eval forward)
+    gpt_model.eval()
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        x_val = torch.randint(
+            0, raw_gpt_model.pad_token_id,
+            (gpu_batch_size_val, seq_len_val), device=device
+        )
+        y_val = torch.randint(
+            0, raw_gpt_model.pad_token_id,
+            (gpu_batch_size_val, seq_len_val), device=device
+        )
+        if raw_gpt_model.use_doc_masking:
+            step = max(16, seq_len_val // 8)
+            idxs = torch.arange(seq_len_val, device=device)[None, :]
+            rand_offsets = torch.randint(0, step, (gpu_batch_size_val, 1), device=device)
+            is_eos = ((idxs + rand_offsets) % step == 0)
+            doc_ids_val = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+        else:
+            doc_ids_val = None
+
+        _ = gpt_model(x_val, y_val, document_ids=doc_ids_val)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # restore state
+    raw_gpt_model.load_state_dict(model_state)
+    for k, optimizer in optimizers.items():
+        optimizer.load_state_dict(optimizer_states[k])
+    torch.set_rng_state(rng_state_cpu)
+    torch.cuda.set_rng_state(rng_state_cuda)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+_kernel_warmup(num_train_steps=2)
 
 ##################################################################
 #  Training, Validation, Sampling, HellaSwag, Checkpointing loop #
