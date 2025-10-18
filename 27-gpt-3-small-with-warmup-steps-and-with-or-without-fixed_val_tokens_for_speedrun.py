@@ -1378,9 +1378,8 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
 # ---------------------------------------------------------
 
 def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
+    hellaswag_examples_per_batch = max(1, hellaswag_examples_per_batch)
     max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
-    if max_gpu_sequences_per_batch > gpu_batch_size_val:
-        raise ValueError(f"HellaSwag batch size {max_gpu_sequences_per_batch} exceeds {gpu_batch_size_val}")
 
     gpt_model.eval()
     total_correct_predictions = 0
@@ -1393,18 +1392,6 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
     one_shot_correct_label_char = chr(ord('A') + int(one_shot_example['label']))
 
     max_model_seq_len = raw_gpt_model.max_seq_len 
-    
-    pre_allocated_input_ids = torch.full(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        raw_gpt_model.pad_token_id, 
-        dtype=torch.long, 
-        device=device
-    )
-    pre_allocated_attn_mask = torch.zeros(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        dtype=torch.bool, 
-        device=device
-    )
 
     with torch.inference_mode():
         num_example_batches = (total_dataset_examples + hellaswag_examples_per_batch - 1) // hellaswag_examples_per_batch
@@ -1468,15 +1455,31 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
                     all_seq_ids.append(combined_seq_ids)
                     orig_example_indices.append(ex_idx_in_batch)
 
-            pre_allocated_input_ids.fill_(raw_gpt_model.pad_token_id)
-            pre_allocated_attn_mask.zero_()
+            # allocate to the actual max length in this pass (rounded for kernels, capped to model max)
+            max_len_in_batch = max(len(s) for s in all_seq_ids) if all_seq_ids else 1
+            round_multiple = 8
+            alloc_len = min(max_model_seq_len, math.ceil(max_len_in_batch / round_multiple) * round_multiple)
+
+            pre_allocated_input_ids = torch.full(
+                (max_gpu_sequences_per_batch, alloc_len),
+                raw_gpt_model.pad_token_id,
+                dtype=torch.long,
+                device=device
+            )
+            pre_allocated_attn_mask = torch.zeros(
+                (max_gpu_sequences_per_batch, alloc_len),
+                dtype=torch.bool,
+                device=device
+            )
 
             for idx, seq_ids in enumerate(all_seq_ids):
                 pre_allocated_input_ids[idx, :len(seq_ids)] = torch.tensor(seq_ids, dtype=torch.long, device=device)
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=pre_allocated_attn_mask, ignore_doc_mask=True)
+                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
+                # so we can skip passing an attn_mask
+                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             # log softmax: softmax followed by log (to sum log-probs vs. multiply low-value probs)
             log_probs = F.log_softmax(logits, dim=-1)
@@ -1537,9 +1540,8 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
     return accuracy
 
 def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
+    hellaswag_examples_per_batch = max(1, hellaswag_examples_per_batch)
     max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
-    if max_gpu_sequences_per_batch > gpu_batch_size_val:
-        raise ValueError(f"HellaSwag batch size {max_gpu_sequences_per_batch} exceeds {gpu_batch_size_val}")
 
     gpt_model.eval()
     total_correct_predictions = 0
@@ -1553,18 +1555,6 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
 
     max_model_seq_len = raw_gpt_model.max_seq_len 
     
-    pre_allocated_input_ids = torch.full(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        raw_gpt_model.pad_token_id, 
-        dtype=torch.long, 
-        device=device
-    )
-    pre_allocated_attn_mask = torch.zeros(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        dtype=torch.bool, 
-        device=device
-    )
-
     with torch.inference_mode():
         num_example_batches = (total_dataset_examples + hellaswag_examples_per_batch - 1) // hellaswag_examples_per_batch
 
@@ -1609,15 +1599,31 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
                     orig_example_indices.append(ex_idx_in_batch)
                     prefix_lengths.append(len(context_ids))
 
-            pre_allocated_input_ids.fill_(raw_gpt_model.pad_token_id)
-            pre_allocated_attn_mask.zero_()
+            # allocate to the actual max length in this pass (rounded for kernels, capped to model max)
+            max_len_in_batch = max(len(s) for s in all_seq_ids) if all_seq_ids else 1
+            round_multiple = 8
+            alloc_len = min(max_model_seq_len, math.ceil(max_len_in_batch / round_multiple) * round_multiple)
+
+            pre_allocated_input_ids = torch.full(
+                (max_gpu_sequences_per_batch, alloc_len),
+                raw_gpt_model.pad_token_id,
+                dtype=torch.long,
+                device=device
+            )
+            pre_allocated_attn_mask = torch.zeros(
+                (max_gpu_sequences_per_batch, alloc_len),
+                dtype=torch.bool,
+                device=device
+            )
 
             for idx, seq_ids in enumerate(all_seq_ids):
                 pre_allocated_input_ids[idx, :len(seq_ids)] = torch.tensor(seq_ids, dtype=torch.long, device=device)
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=pre_allocated_attn_mask, ignore_doc_mask=True)
+                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
+                # so we can skip passing an attn_mask
+                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             log_probs = F.log_softmax(logits, dim=-1)
 
@@ -2176,6 +2182,67 @@ def _kernel_warmup(num_train_steps=2):
     if dist.is_initialized():
         dist.barrier()
 
+    # sampling-shape warmup
+    raw_gpt_model.eval()
+    max_new_tokens = get_sample_token_count(start_step)
+    max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
+    initial_input_ids_list = [
+        tokenizer.encode(sequence)[:max_allowed_input_len] 
+        for sequence in sample_sequences
+    ]
+    max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
+    alloc_len = max_input_len + max_new_tokens
+    round_multiple = 128 if raw_gpt_model.use_flex_attention else 8
+    alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
+
+    sampling_input_ids = torch.full(
+        (len(sample_sequences), alloc_len),
+        raw_gpt_model.pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+    for i, ids in enumerate(initial_input_ids_list):
+        if ids:
+            sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        _ = raw_gpt_model(
+            sampling_input_ids,
+            attn_mask=None,
+            ignore_doc_mask=True,
+            document_ids=None,
+        )
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # hellaswag-shape warmup
+    raw_gpt_model.eval()
+    hellaswag_examples_per_batch = 16
+    max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
+
+    alloc_len = min(1024, raw_gpt_model.max_seq_len)
+
+    pre_allocated_input_ids = torch.full(
+        (max_gpu_sequences_per_batch, alloc_len),
+        raw_gpt_model.pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        _ = raw_gpt_model(
+            pre_allocated_input_ids,
+            attn_mask=None,
+            ignore_doc_mask=True,
+            document_ids=None,
+        )
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
     # restore state
     raw_gpt_model.load_state_dict(model_state)
     for k, optimizer in optimizers.items():
@@ -2321,11 +2388,15 @@ try:
             sample_step_t = end_sample_t - start_sample_t
             total_sample_t += sample_step_t
             total_t += sample_step_t
+            if master_process:
+                message = f"step: {step:,} | sampling time: {(sample_step_t):,.2f} s"
+                print(message)
+                log_buffer.append(message)
 
         if (step % hellaswag_interval == 0 and step > 0) or step == max_steps - 1:
             torch.cuda.synchronize()
             start_hellaswag_t = time.time()
-            accuracy = evaluate_hellaswag_standard(hellaswag_examples_per_batch=gpu_batch_size_val//4)
+            accuracy = evaluate_hellaswag_standard()
             torch.cuda.synchronize()
             end_hellaswag_t = time.time()
             hellaswag_step_t = end_hellaswag_t - start_hellaswag_t
