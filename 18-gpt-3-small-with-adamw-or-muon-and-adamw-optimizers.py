@@ -944,9 +944,8 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
 # ---------------------------------------------------------
 
 def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
+    hellaswag_examples_per_batch = max(1, hellaswag_examples_per_batch)
     max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
-    if max_gpu_sequences_per_batch > gpu_batch_size:
-        raise ValueError(f"HellaSwag batch size {max_gpu_sequences_per_batch} exceeds {gpu_batch_size}")
 
     gpt_model.eval()
     total_correct_predictions = 0
@@ -1103,9 +1102,8 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
     return accuracy
 
 def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
+    hellaswag_examples_per_batch = max(1, hellaswag_examples_per_batch)
     max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
-    if max_gpu_sequences_per_batch > gpu_batch_size:
-        raise ValueError(f"HellaSwag batch size {max_gpu_sequences_per_batch} exceeds {gpu_batch_size}")
 
     gpt_model.eval()
     total_correct_predictions = 0
@@ -1675,11 +1673,15 @@ try:
             sample_step_t = end_sample_t - start_sample_t
             total_sample_t += sample_step_t
             total_t += sample_step_t
+            if master_process:
+                message = f"step: {step:,} | sampling time: {(sample_step_t):,.2f} s"
+                print(message)
+                log_buffer.append(message)
 
         if (step % hellaswag_interval == 0 and step > 0) or step == max_steps - 1:
             torch.cuda.synchronize()
             start_hellaswag_t = time.time()
-            accuracy = evaluate_hellaswag_standard(hellaswag_examples_per_batch=gpu_batch_size//4)
+            accuracy = evaluate_hellaswag_standard()
             torch.cuda.synchronize()
             end_hellaswag_t = time.time()
             hellaswag_step_t = end_hellaswag_t - start_hellaswag_t

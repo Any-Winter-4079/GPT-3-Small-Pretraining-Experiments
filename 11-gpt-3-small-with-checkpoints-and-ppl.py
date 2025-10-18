@@ -737,7 +737,7 @@ val_interval = 25
 if master_process:
     print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_mini_step:,} tokens per val step)")
 
-sample_interval = 25
+sample_interval = 250
 sample_sequences = [
     "The universe has always been",
     "Who am I? I am a language model",
@@ -905,6 +905,10 @@ try:
             sample_step_t = end_sample_t - start_sample_t
             total_sample_t += sample_step_t
             total_t += sample_step_t
+            if master_process:
+                message = f"step: {step:,} | sampling time: {(sample_step_t):,.2f} s"
+                print(message)
+                log_buffer.append(message)
 
         if (step % val_interval == 0 and step > 0) or step == max_steps - 1:
             start_val_t = time.time()

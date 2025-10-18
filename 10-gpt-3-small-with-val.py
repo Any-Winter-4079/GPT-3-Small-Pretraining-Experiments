@@ -660,6 +660,8 @@ for step in range(max_steps):
         sample_step_t = end_sample_t - start_sample_t
         total_sample_t += sample_step_t
         total_t += sample_step_t
+        if master_process:
+            print(f"step: {step:,} | sampling time: {(sample_step_t):,.2f} s")
 
     if (step % val_interval == 0 and step > 0) or step == max_steps - 1:
         start_val_t = time.time()

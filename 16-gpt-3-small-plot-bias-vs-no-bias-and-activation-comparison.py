@@ -33,7 +33,7 @@ hf_user = os.getenv("hf_user")
 hf_token = os.getenv("hf_token")
 
 train_re = re.compile(
-    r"step:\s*([\d,]+)\s*\|.*?train loss:\s*([0-9.]+).*?norm:\s*([0-9.]+)"
+    r"step:\s*([\d,]+)\s*\|.*?train loss:\s*([0-9.]+).*?grad norm:\s*([0-9.]+)"
     r".*?lr:\s*([0-9.e-]+).*?tok/s:\s*([\d.,]+).*?total toks:\s*([\d,]+)"
     r".*?total time:\s*([\d.,]+)"
 )
