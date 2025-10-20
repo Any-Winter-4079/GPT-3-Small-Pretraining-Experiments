@@ -1814,7 +1814,7 @@ master_process = ddp_rank == 0
 # This ensures training losses are stored only after a checkpointing step happens.
 log_buffer = []
 
-total_tokens_per_step = 2**18 # 2**19 == 524,288 or ~500M tokens from Language Models are Few-Shot Learners
+total_tokens_per_step_train = 2**18 # 2**19 == 524,288 or ~0.5M tokens from Language Models are Few-Shot Learners
 factor = 2
 gpu_batch_size_train = 64 // factor
 gpu_batch_size_val = 64 // factor
@@ -1822,9 +1822,8 @@ seq_len_train =  1024 * factor
 seq_len_val = 1024 * factor
 
 total_tokens_per_mini_step_train = ddp_world_size * gpu_batch_size_train * seq_len_train
-grad_accum_mini_steps = total_tokens_per_step // total_tokens_per_mini_step_train
-total_tokens_per_step_train = total_tokens_per_mini_step_train * grad_accum_mini_steps
-assert total_tokens_per_step % total_tokens_per_mini_step_train == 0
+grad_accum_mini_steps = total_tokens_per_step_train // total_tokens_per_mini_step_train
+assert total_tokens_per_step_train % total_tokens_per_mini_step_train == 0
 if master_process:
     message = f"per-gpu gradient accumulation mini-steps: {grad_accum_mini_steps}"
     print(message)
@@ -1840,10 +1839,10 @@ max_tokens = 5*10**9
 weight_decay = 0.1
 hard_min_lr = 7e-4
 
-max_steps = max_tokens // total_tokens_per_step
+max_steps = max_tokens // total_tokens_per_step_train
 min_lr_after_warmup = min_lr_after_warmup_ratio * max_lr
-warmup_steps = warmup_tokens // total_tokens_per_step
-warmup_and_cosine_steps = warmup_and_cosine_tokens // total_tokens_per_step
+warmup_steps = warmup_tokens // total_tokens_per_step_train
+warmup_and_cosine_steps = warmup_and_cosine_tokens // total_tokens_per_step_train
 if master_process:
     messages = [
         f"warmup steps: {warmup_steps:,}",
@@ -2024,7 +2023,7 @@ def save_config_info():
 
         f.write(f"ddp world size: {ddp_world_size}\n")
 
-        f.write(f"total tokens per step: {total_tokens_per_step}\n")
+        f.write(f"total tokens per step (train): {total_tokens_per_step_train}\n")
         f.write(f"gpu batch size (train): {gpu_batch_size_train}\n")
         f.write(f"gpu batch size (val): {gpu_batch_size_val}\n")
         f.write(f"seq len (train): {seq_len_train}\n")

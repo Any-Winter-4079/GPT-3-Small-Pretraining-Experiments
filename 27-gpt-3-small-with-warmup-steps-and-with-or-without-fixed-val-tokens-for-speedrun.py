@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import copy
 import math
 import time
 import torch
@@ -16,18 +18,22 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import save_model, load_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 24-gpt-3-small-with-shard-prefetching.py
+# torchrun --standalone --nproc_per_node=4 27-gpt-3-small-with-warmup-steps-and-with-or-without-fixed-val-tokens-for-speedrun.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
 # 4 x H100 SXM | 56 vCPU 503 GB RAM | $10.86/h # 
 ################################################
 
+################################################
+#                   GPT Config                 #
+################################################
 @dataclass
 class GPTConfig:
-    max_seq_len: int = 1024
+    max_seq_len: int = 1024 # overwritten by max(seq_len_train, seq_len_val)
     vocab_size: int = 50304
     n_layers: int = 12
     # n_heads == n_kv_heads    for MHA (Multi-Head Attention)
@@ -41,14 +47,18 @@ class GPTConfig:
     n_kv_heads: int = 4
     d_model: int = 768
     up_proj_factor: int = 4
-    tied_embeddings: bool = True
+    use_tied_embeddings: bool = True
     pad_token_id: int = 50257
+    eos_token_id: int = 50256
     norm_type: str = "rms" # "rms" or any other name for "layer"
-    bias: bool = False
+    use_bias: bool = False
+
     pos_encoding_type: str = "rope" # "rope", "nope", or any other name for "absolute"
     rope_base_theta: int = 500_000
-    fair: bool = True
+
     activation: str = "swiglu" # "gelu", "relu", "relu2" (relu^2), "silu" or "swiglu"
+    use_fair_swiglu: bool = True # only if swiglu
+
     optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
     # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
     muon_lr_scale: float = 0.15
@@ -56,22 +66,143 @@ class GPTConfig:
     # try 5–10; 8–10 for slightly “tighter” orthogonalization (slower)
     muon_backend_steps: int = 8
     muon_momentum: float = 0.95
-    muon_nesterov: bool = True
+    use_nesterov: bool = True
+
     # <-- Uncomment for gradient norm clipping -->
     # use_grad_norm_clipping: bool = False
     # gradient_clipping_norm: float = 1.0
     # <-- Uncomment for gradient norm clipping -->
-    qk_norm: bool = True
+
+    use_qk_norm: bool = True
     qk_norm_type: str = "rms" # "rms" or any other name for "l2"
     qk_scale_init: float = 1.0 # init per-head scale
     qk_scale_max: float = 5.0 # cap scales to keep logits in range
     qk_eps: float = 1e-6
-    qk_debug_log: bool = True
+    use_qk_debug_log: bool = True
+
     # <-- Uncomment for logit soft-capping -->
     # use_lm_head_logit_softcapping: bool = True
     # lm_head_logit_softcap: float = 20.0
     # <-- Uncomment for logit soft-capping -->
 
+    is_causal: bool = True # True for decoders or False for encoders - NOTE: affects sliding_window_size! -
+    use_flex_attention: bool = True # True for FlexAttention or False for SDPA
+    # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
+    # While is_causal, RoPE and sampling are supported by both (SDPA and FlexAttention) branches
+    use_doc_masking: bool = True
+    use_sliding_window_attention: bool = True # True for Sliding Window (local) Attention (e.g., Mistral-style)
+    sliding_window_size: int = 1024 # number of most-recent tokens a query can attend to (only used if use_sliding_window_attention=True)
+    use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
+    attn_logit_softcap: float = 15.0
+    tanh_backend: str = "ptx" # "clamp", "ptx" (faster) or "rational" or "exact"
+
+################################################
+#            Fast tanh Soft Capping            #
+################################################
+# adapted from PyTorch FlexAttention "attention-gym" example
+# -- Start of (modified) source: https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/mods/softcapping.py --
+_PTX_TANH_LOWERED = False
+
+try:
+    # use inductor internals if present; otherwise we keep ptx unavailable
+    from functools import partial
+    from torch._inductor.virtualized import ops
+    from torch._inductor.lowering import make_pointwise, register_lowering
+
+    # avoid double-registrations when re-running in dev
+    try:
+        torch.ops.approx.tanh
+        _ALREADY_REGISTERED = True
+    except (AttributeError, RuntimeError):
+        _ALREADY_REGISTERED = False
+
+    if not _ALREADY_REGISTERED:
+        @torch.library.custom_op("approx::tanh", mutates_args=())
+        def _tanh_approx(inp: torch.Tensor) -> torch.Tensor:
+            # eager fallback path
+            return torch.tanh(inp)
+
+        @_tanh_approx.register_fake
+        def _(inp: torch.Tensor) -> torch.Tensor:
+            return torch.tanh(inp)
+
+        def _tanh_approx_lowering(inp):
+            # inline ptx (f32)
+            fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
+            return make_pointwise(fn)(inp)
+
+        register_lowering(torch.ops.approx.tanh)(_tanh_approx_lowering)
+
+    _PTX_TANH_LOWERED = True
+except Exception:
+    # any failure leaves ptx unavailable
+    _PTX_TANH_LOWERED = False
+
+class _TanhApproxFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # ptx op is f32; caller upcasts beforehand
+        y = torch.ops.approx.tanh(x)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (y,) = ctx.saved_tensors
+        # d/dx tanh(x) = 1 - tanh^2(x)
+        return grad_out * (1 - y * y)
+
+def _tanh_ptx(x: torch.Tensor) -> torch.Tensor:
+    # expects float32
+    return _TanhApproxFn.apply(x)
+
+def generate_tanh_softcap(soft_cap: float, backend: str):
+    """
+    returns a score_mod closure for flexattention that applies tanh soft-capping.
+
+    backend: "ptx" | "rational" | "exact"
+      - "ptx": use inline ptx tanh.approx (requires inductor lowering to be available)
+      - "rational": use polynomial approx (fast & portable)
+      - "exact": use torch.tanh
+    """
+    sc = float(soft_cap)
+
+    if backend == "clamp":
+        def fn(score):
+            # clamp to [-sc, sc] with no transcendental ops
+            return torch.clamp(score, min=-sc, max=sc)
+    elif backend == "exact":
+        def fn(score):
+            return sc * torch.tanh(score / sc)
+    elif backend == "rational":
+        def fn(score):
+            z = (score / sc).to(torch.float32)
+            x2 = z * z
+            y = z * (27.0 + x2) / (27.0 + 9.0 * x2)
+            return (y * sc).to(dtype=score.dtype)
+    elif backend == "ptx":
+        if not _PTX_TANH_LOWERED:
+            raise RuntimeError(
+                "tanh_backend='ptx' requested, but ptx lowering is unavailable. "
+                "pick 'rational' or 'exact'."
+            )
+        def fn(score):
+            z32 = (score / sc).to(torch.float32)
+            y32 = _tanh_ptx(z32)
+            return (y32.to(score.dtype) * sc)
+    else:
+        raise ValueError(f"unknown tanh backend: {backend}")
+
+    def tanh_softcap(score, b, h, q_idx, kv_idx):
+        return fn(score)
+
+    tanh_softcap.__name__ = f"tanh_softcap_{backend}_{int(sc)}"
+    return tanh_softcap
+# -- End of (modified) source: https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/mods/softcapping.py --
+
+################################################
+#                      RoPE                    #
+################################################
 class Rotary(nn.Module):
     def __init__(self, head_size, base_theta, max_seq_len):
         super().__init__()
@@ -121,7 +252,9 @@ def apply_rotation(q, k, cos, sin):
     
     return q, k
 
-# -----------------------------------------------------------
+################################################
+#                     Muon                     #
+################################################
 # In Muon, the goal is:
 #   For 2D weight matrices (e.g., Linear weights of shape (out_features, in_features)),
 #   build an SGD+momentum update g, then REPLACE it with its nearest orthogonal
@@ -263,9 +396,14 @@ class Muon(torch.optim.Optimizer):
                 p.data.add_(g, alpha=-lr * scale)
 # -- End of (modified) source: https://github.com/tyler-romero/nanogpt-speedrun/blob/main/src/train_gpt2.py --
 
+################################################
+#                  DataLoader                  #
+################################################
 class DataLoader:
     def __init__(self, gpu_batch_size, seq_len, ddp_world_size, ddp_rank, data_folder, split="train", 
-                 epoch=0, current_shard_idx=0, grad_accum_mini_steps_per_shard_counter=0):
+                 epoch=0, current_shard_idx=0, grad_accum_mini_steps_per_shard_counter=0,
+                 pad_token_id=50257, eos_token_id=50256, return_document_ids=False,
+                 shuffle_val_tokens=True):
         # batch size each gpu can fit in
         self.gpu_batch_size = gpu_batch_size
         # seq len for each gpu
@@ -276,6 +414,10 @@ class DataLoader:
         self.ddp_global_rank = ddp_rank
         self.split = split
         self.epoch = epoch
+        self.pad_token_id = pad_token_id
+        self.eos_token_id = eos_token_id
+        self.return_document_ids = return_document_ids
+        self.shuffle_val_tokens = shuffle_val_tokens
 
         shards = os.listdir(data_folder)
         shards = [shard for shard in shards if split in shard]
@@ -342,11 +484,14 @@ class DataLoader:
             log_buffer.append(message)
     
     def _shuffle_shard(self):
-        g = torch.Generator()
-        g.manual_seed(self.current_shard_idx + self.epoch)
-        # e.g., [0, 2048, 11264, 10240, 4096, 9216, 1024, 5120, 6144, 8192, 3072, 7168]
-        shuffled_indices = torch.randperm(len(self.x_seq_starts), generator=g).tolist()
-        self.x_seq_starts = [self.x_seq_starts[i] for i in shuffled_indices]
+        if self.split == "train" or (self.split == "val" and self.shuffle_val_tokens):
+            g = torch.Generator()
+            g.manual_seed(self.current_shard_idx + self.epoch)
+            # e.g., [0, 2048, 11264, 10240, 4096, 9216, 1024, 5120, 6144, 8192, 3072, 7168]
+            shuffled_indices = torch.randperm(len(self.x_seq_starts), generator=g).tolist()
+            self.x_seq_starts = [self.x_seq_starts[i] for i in shuffled_indices]
+        # else: keep original order for validation (global prefix)
+
         # e.g., 12 * 0 / 2 = 0 for gpu0, 12 * 1 / 2 = 6 for gpu 1
         gpu_x_seq_start_idx = len(self.x_seq_starts) * self.ddp_global_rank // self.ddp_world_size
         # e.g., 0 + 12 / 2 = 6 for gpu0, 6 + 12 / 2 = 12 for gpu 1
@@ -354,6 +499,7 @@ class DataLoader:
         # e.g., [0, 2048, 11264, 10240, 4096, 9216] for gpu 0
         # [1024, 5120, 6144, 8192, 3072, 7168] for gpu 1
         self.gpu_x_seq_starts = self.x_seq_starts[gpu_x_seq_start_idx:gpu_x_seq_end_idx]
+
 
     def _start_shard_prefetch(self):
         # prefetch the next shard if not already running
@@ -414,19 +560,38 @@ class DataLoader:
             self._shuffle_shard()
             # immediately prefetch the following shard
             self._start_shard_prefetch()
-        # e.g., 0 for the 1st grad accum mini-step, gpu_batch_size for the 2nd grad accum mini-step, etc.
-        i = self.grad_accum_mini_steps_per_shard_counter * self.gpu_batch_size
-        # e.g., for gpu 0: [0, 2048] for the 1st grad accum mini-step, [11264, 10240] for the 2nd grad accum mini-step, etc.
-        #       for gpu 1: [1024, 5120] for the 1st grad accum mini-step, [6144, 8192] for the 2nd grad accum mini-step, etc.
-        batch_starts = self.gpu_x_seq_starts[i:i + self.gpu_batch_size]
-        # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
-        #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+        
+        if (self.split == "val") and (not self.shuffle_val_tokens):
+            # global, ordered prefix partitioning across ranks
+            global_batch_start = self.grad_accum_mini_steps_per_shard_counter * self.ddp_world_size * self.gpu_batch_size
+            start = global_batch_start + self.ddp_global_rank * self.gpu_batch_size
+            batch_starts = self.x_seq_starts[start:start + self.gpu_batch_size]
+        else:
+            # e.g., 0 for the 1st grad accum mini-step, gpu_batch_size for the 2nd grad accum mini-step, etc.
+            i = self.grad_accum_mini_steps_per_shard_counter * self.gpu_batch_size
+            # e.g., for gpu 0: [0, 2048] for the 1st grad accum mini-step, [11264, 10240] for the 2nd grad accum mini-step, etc.
+            #       for gpu 1: [1024, 5120] for the 1st grad accum mini-step, [6144, 8192] for the 2nd grad accum mini-step, etc.
+            batch_starts = self.gpu_x_seq_starts[i:i + self.gpu_batch_size]
+            # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
+            #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+
         x = torch.stack([self.tokens[start:start + self.seq_len] for start in batch_starts])
         y = torch.stack([self.tokens[start + 1:start + self.seq_len + 1] for start in batch_starts])
+
+        # optional doc ids (per-token doc index within the window)
+        doc_ids = None
+        if self.return_document_ids:
+            is_eos = (x == self.eos_token_id)
+            doc_ids = torch.cumsum(is_eos.to(torch.int32), dim=1)
+            doc_ids = doc_ids - is_eos.to(torch.int32)
+
         # a full mini-step is to be done after this
         self.grad_accum_mini_steps_per_shard_counter += 1
-        return x, y
-    
+        return x, y, doc_ids
+
+################################################
+#                QK Norm Debug                 #
+################################################
 @torch.no_grad()
 def qk_scale_debug_string(model):
     max_q_raw = 0.0
@@ -458,11 +623,10 @@ def qk_scale_debug_string(model):
         f"max k_scale raw/eff: {max_k_raw:.4f}/{max_k_eff:.4f}"
     )
 
-def softcap_logits(x, cap):
-    cap_t = x.new_tensor(cap)
-    return cap_t * torch.tanh(x / cap_t)
-
-class CausalSelfAttention(nn.Module):
+################################################
+#                Self Attention                #
+################################################
+class SelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         
@@ -474,16 +638,18 @@ class CausalSelfAttention(nn.Module):
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads for GQA/MQA"
         self.head_size = config.d_model // config.n_heads
         self.q_heads_per_kv_head = self.n_heads // self.n_kv_heads
-        self.q_proj = nn.Linear(config.d_model, self.n_heads * self.head_size, bias=config.bias)
-        self.k_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_size, bias=config.bias)
-        self.v_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_size, bias=config.bias)
-        self.c_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
+        self.q_proj = nn.Linear(config.d_model, self.n_heads * self.head_size, bias=config.use_bias)
+        self.k_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_size, bias=config.use_bias)
+        self.v_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_size, bias=config.use_bias)
+        self.c_proj = nn.Linear(config.d_model, config.d_model, bias=config.use_bias)
+        
         self.rotary = Rotary(self.head_size, config.rope_base_theta, config.max_seq_len) if config.pos_encoding_type.lower() == "rope" else None
-        self.qk_norm = config.qk_norm
+        
+        self.use_qk_norm = config.use_qk_norm
         self.qk_norm_type = config.qk_norm_type
         self.qk_scale_max = config.qk_scale_max
         self.qk_eps = config.qk_eps
-        if self.qk_norm:
+        if self.use_qk_norm:
             # q_scale and k_scale are learned per-head scalars, like LayerNorm’s γ, that let 
             # the model adjust magnitude after normalization
             # They end up controlling the temperature of attention logits
@@ -513,13 +679,29 @@ class CausalSelfAttention(nn.Module):
             #   ---
             self.q_scale = nn.Parameter(torch.full((1, self.n_heads, 1, 1), config.qk_scale_init))
             self.k_scale = nn.Parameter(torch.full((1, self.n_kv_heads, 1, 1), config.qk_scale_init))
+            
+        self.is_causal = config.is_causal
+        self.use_flex_attention = config.use_flex_attention
+        self.use_doc_masking = config.use_doc_masking
+        self.use_sliding_window_attention = config.use_sliding_window_attention
+        self.sliding_window_size = config.sliding_window_size
+        self.use_attn_logit_softcapping = config.use_attn_logit_softcapping
+        self.attn_logit_softcap = config.attn_logit_softcap
 
-    def forward(self, x, attn_mask=None):
-        gpu_batch_size, seq_len, d_model = x.size()
+        if (self.use_doc_masking or self.use_sliding_window_attention or self.use_attn_logit_softcapping):
+            assert self.use_flex_attention, "Document masking / SWA / attention soft-capping require use_flex_attention=True"
+        if self.use_sliding_window_attention:
+            assert self.sliding_window_size > 0, "sliding_window_size must be > 0 with use_sliding_window_attention=True"
 
-        q = self.q_proj(x).view(gpu_batch_size, seq_len, self.n_heads, self.head_size).transpose(1, 2)
-        k = self.k_proj(x).view(gpu_batch_size, seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
-        v = self.v_proj(x).view(gpu_batch_size, seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+        self.tanh_backend = config.tanh_backend
+        self._score_mod = generate_tanh_softcap(self.attn_logit_softcap, backend=self.tanh_backend) if self.use_attn_logit_softcapping else None
+
+    def forward(self, x, flex_attn_block_mask=None, sdpa_attn_mask=None):
+        _, seq_len, d_model = x.size()
+
+        q = self.q_proj(x).view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
+        k = self.k_proj(x).view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
+        v = self.v_proj(x).view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
 
         if self.rotary is not None:
             # apply RoPE
@@ -528,10 +710,10 @@ class CausalSelfAttention(nn.Module):
 
         if self.n_kv_heads != self.n_heads:
             # expand KV to heads if needed
-            k = k.unsqueeze(2).expand(gpu_batch_size, self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(gpu_batch_size, self.n_heads, seq_len, self.head_size)
-            v = v.unsqueeze(2).expand(gpu_batch_size, self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(gpu_batch_size, self.n_heads, seq_len, self.head_size)
+            k = k.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
+            v = v.unsqueeze(2).expand(x.size(0), self.n_kv_heads, self.q_heads_per_kv_head, seq_len, self.head_size).reshape(x.size(0), self.n_heads, seq_len, self.head_size)
 
-        if self.qk_norm:
+        if self.use_qk_norm:
             if self.qk_norm_type == "rms":
                 # 1 / RMS, i.e.,
                 # 1 / RMS(q) = 1 / sqrt(mean(q_i^2)) = 1 / (sqrt(1/head_size * sum(q_i^2))) =
@@ -557,6 +739,8 @@ class CausalSelfAttention(nn.Module):
                 k_scale = k_scale.repeat(1, self.q_heads_per_kv_head, 1, 1)
 
             # keep numerics tidy under autocast
+            q_gain = q_gain.to(dtype=q.dtype)
+            k_gain = k_gain.to(dtype=k.dtype)
             q_scale = q_scale.to(dtype=q.dtype)
             k_scale = k_scale.to(dtype=k.dtype)
 
@@ -566,58 +750,21 @@ class CausalSelfAttention(nn.Module):
             # (gpu_batch_size, n_heads, seq_len, head_size) * (1, n_heads, 1, 1)
             k = k * k_gain * k_scale
 
-        # if a mask is passed
-        if attn_mask is not None:
-            if attn_mask.dtype != torch.bool:
-                attn_mask = attn_mask.bool()
-            # if (gpu_batch_size, seq_len)
-            if attn_mask.dim() == 2:
-                # insert two dimensions to reach shape (gpu_batch_size, 1, seq_len, 1)
-                q_valid = attn_mask[:, None, :, None]
-                # insert two dimensions to reach shape (gpu_batch_size, 1, 1, seq_len)
-                k_valid = attn_mask[:, None, None, :]
-                allow_mask_4d = q_valid & k_valid
-            # if (gpu_batch_size, seq_len, seq_len)
-            elif attn_mask.dim() == 3:
-                # insert one dimension to reach shape (gpu_batch_size, 1, seq_len, seq_len)
-                allow_mask_4d = attn_mask[:, None, :, :]
-            # else: keep as [gpu_batch_size, 1, seq_len, seq_len] or [gpu_batch_size, n_heads, seq_len, seq_len]
-            elif attn_mask.dim() == 4:
-                allow_mask_4d = attn_mask
-            else:
-                raise ValueError(f"attn_mask must be 2D/3D/4D, got shape {attn_mask.shape}")
-            
-            # upper triangular is set to zeros
-            causal = torch.tril(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool))
-            # insert two dimensions to reach shape (1, 1, seq_len, seq_len)
-            causal = causal[None, None, :, :]
-
-            # combine masks, with the causal mask being broadcasted in the first dimension
-            # to result in (gpu_batch_size, 1, seq_len, seq_len) -unless dim=4 is passed as
-            # (gpu_batch_size, n_heads, seq_len, seq_len) in which case 2 broadcasts apply-
-            allow_mask_4d = allow_mask_4d & causal
-            # as per scaled_dot_product_attention docs: sent mask is negated then filled with -infinity where True
-            # (after negation, i.e., what is False in our attn_mask is turned into -infinity)
-            # attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-            # so our attn_mask True's are kept, False's are disregarded, i.e., we need to buil a ** keep mask **
-            attn_mask = allow_mask_4d
-
-            is_causal = False
-
-            # safety check
-            assert attn_mask.shape[0] == gpu_batch_size and \
-            (attn_mask.shape[1] == 1 or attn_mask.shape[1] == self.n_heads) and \
-            attn_mask.shape[2:] == (seq_len, seq_len), \
-                f"attn_mask shape mismatch: got {attn_mask.shape}, expected ({gpu_batch_size}, 1 or {self.n_heads}, {seq_len}, {seq_len})"
-        # if no attention mask, use the default built-in mask (when is_causal=True)
+        # FlexAttention
+        if self.use_flex_attention:
+            y = flex_attention(q, k, v, score_mod=self._score_mod, block_mask=flex_attn_block_mask)
+        # SDPA
         else:
-            is_causal = True
+            is_causal = self.is_causal and (sdpa_attn_mask is None)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_attn_mask, is_causal=is_causal)
 
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
-        y = y.transpose(1,2).contiguous().view(gpu_batch_size, seq_len, d_model)
+        y = y.transpose(1, 2).contiguous().view(x.size(0), seq_len, d_model)
         y = self.c_proj(y)
         return y
 
+################################################
+#                     MLP                      #
+################################################
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -638,13 +785,13 @@ class MLP(nn.Module):
             # 1 down projection of size (2 / 3 * up_proj_factor * d_model, d_model) with -if used- d_model biases
             # the total number of weight parameters matches, but, if used, biases -slightly- differ as
             # up_proj_factor * d_model + d_model != 2 * 2 / 3 * up_proj_factor * d_model + d_model
-            self.hidden_dim = int(round((2.0/3.0) * config.up_proj_factor * config.d_model)) if config.fair else config.up_proj_factor * config.d_model
-            self.c_fc = nn.Linear(config.d_model, self.hidden_dim * 2, bias=config.bias)
-            self.c_proj = nn.Linear(self.hidden_dim, config.d_model, bias=config.bias)
+            self.hidden_dim = int(round((2.0/3.0) * config.up_proj_factor * config.d_model)) if config.use_fair_swiglu else config.up_proj_factor * config.d_model
+            self.c_fc = nn.Linear(config.d_model, self.hidden_dim * 2, bias=config.use_bias)
+            self.c_proj = nn.Linear(self.hidden_dim, config.d_model, bias=config.use_bias)
         else:
             self.hidden_dim = config.up_proj_factor * config.d_model
-            self.c_fc = nn.Linear(config.d_model, self.hidden_dim, bias=config.bias)
-            self.c_proj = nn.Linear(self.hidden_dim, config.d_model, bias=config.bias)
+            self.c_fc = nn.Linear(config.d_model, self.hidden_dim, bias=config.use_bias)
+            self.c_proj = nn.Linear(self.hidden_dim, config.d_model, bias=config.use_bias)
 
     def forward(self, x):
         # Gaussian Error Linear Unit
@@ -668,6 +815,9 @@ class MLP(nn.Module):
             raise ValueError(f"unsupported activation function: {self.activation_name}")
         return self.c_proj(x)
 
+################################################
+#                    Block                     #
+################################################
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -677,18 +827,21 @@ class Block(nn.Module):
             self.ln_1 = nn.RMSNorm(config.d_model)
         else:
             self.ln_1 = nn.LayerNorm(config.d_model)
-        self.attn = CausalSelfAttention(config)
+        self.attn = SelfAttention(config)
         if config.norm_type.lower() == "rms":
             self.ln_2 = nn.RMSNorm(config.d_model)
         else:
             self.ln_2 = nn.LayerNorm(config.d_model)
         self.mlp = MLP(config)
 
-    def forward(self, x, attn_mask=None):
-        x = x + self.residual_scale * self.attn(self.ln_1(x), attn_mask=attn_mask)
+    def forward(self, x, flex_attn_block_mask=None, sdpa_attn_mask=None):
+        x = x + self.residual_scale * self.attn(self.ln_1(x), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
         x = x + self.residual_scale * self.mlp(self.ln_2(x))
         return x
 
+################################################
+#                     GPT                      #
+################################################
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -700,18 +853,25 @@ class GPT(nn.Module):
         self.muon_backend = config.muon_backend
         self.muon_backend_steps = config.muon_backend_steps
         self.muon_momentum = config.muon_momentum
-        self.muon_nesterov = config.muon_nesterov
+        self.use_nesterov = config.use_nesterov
         # <-- Uncomment for gradient norm clipping -->
         # self.use_grad_norm_clipping = config.use_grad_norm_clipping
         # self.gradient_clipping_norm = config.gradient_clipping_norm
         # <-- Uncomment for gradient norm clipping -->
-        self.qk_norm = config.qk_norm
-        self.qk_debug_log = config.qk_debug_log
+        self.use_qk_norm = config.use_qk_norm
+        self.use_qk_debug_log = config.use_qk_debug_log
         # <-- Uncomment for logit soft-capping -->
         # self.use_lm_head_logit_softcapping = config.use_lm_head_logit_softcapping
         # self.lm_head_logit_softcap = config.lm_head_logit_softcap
         # self._logits_absmax_stats = None
         # <-- Uncomment for logit soft-capping -->
+        self.is_causal = config.is_causal
+        self.use_flex_attention = config.use_flex_attention
+        self.use_doc_masking = config.use_doc_masking
+        self.use_sliding_window_attention = config.use_sliding_window_attention
+        self.sliding_window_size = config.sliding_window_size
+        self.use_attn_logit_softcapping = config.use_attn_logit_softcapping
+        self.attn_logit_softcap = config.attn_logit_softcap
 
         if self.pos_encoding_type == "rope" or self.pos_encoding_type == "nope":
             self.transformer = nn.ModuleDict(dict(
@@ -728,8 +888,8 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         
-        self.tied_embeddings = config.tied_embeddings
-        if self.tied_embeddings:
+        self.use_tied_embeddings = config.use_tied_embeddings
+        if self.use_tied_embeddings:
             self.transformer.wte.weight = self.lm_head.weight
         self.apply(self._init_weights)
 
@@ -793,68 +953,138 @@ class GPT(nn.Module):
             muon_params,
             lr=lr * self.muon_lr_scale,
             momentum=self.muon_momentum,
-            nesterov=self.muon_nesterov,
+            nesterov=self.use_nesterov,
             backend=self.muon_backend,
             backend_steps=self.muon_backend_steps,
         )
         return {"adamw": adamw, "muon": muon}
+    
+    def _build_flex_attn_block_mask(self, attn_mask, document_ids, gpu_batch_size, seq_len, device, ignore_doc_mask=False):
+        # static part: causal and sliding window
+        sliding_enabled = self.use_sliding_window_attention and (self.sliding_window_size > 0)
+        window_size = self.sliding_window_size
 
-    def forward(self, indices, targets=None, attn_mask=None):
-        _, seq_len = indices.size()
+        def static_mask_mod(batch_index, head_index, query_index, key_index):
+            if self.is_causal:
+                keep_flag = (query_index >= key_index)
+            else:
+                keep_flag = torch.ones((), dtype=torch.bool, device=device)
+
+            if sliding_enabled:
+                if self.is_causal:
+                    keep_flag = keep_flag & ((query_index - key_index) <= window_size)
+                else:
+                    keep_flag = keep_flag & (torch.abs(query_index - key_index) <= window_size)
+            return keep_flag
+
+        mask_mod = static_mask_mod
+
+        # validity / padding from a 2D attention mask [gpu_batch_size, seq_len]
+        if attn_mask is not None:
+            def valid_mask_mod(batch_index, head_index, query_index, key_index):
+                return attn_mask[batch_index, query_index] & attn_mask[batch_index, key_index]
+            mask_mod = and_masks(mask_mod, valid_mask_mod)
+
+        # same-document constraint using document_ids [gpu_batch_size, seq_len]
+        if self.use_doc_masking and not ignore_doc_mask and (document_ids is not None):
+            def same_doc_mod(batch_index, head_index, query_index, key_index):
+                return document_ids[batch_index, query_index] == document_ids[batch_index, key_index]
+            mask_mod = and_masks(mask_mod, same_doc_mod)
+
+        # create a single block mask shared across heads for this batch
+        block_mask = create_block_mask(
+            mask_mod,
+            B=gpu_batch_size,
+            H=None,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
+            _compile=self.training
+        )
+        return block_mask
+    
+    def _normalize_attn_mask(self, attn_mask, gpu_batch_size, seq_len, device, for_flex):
+        if attn_mask is None:
+            return None
+        if attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.bool()
+        if attn_mask.dim() != 2:
+            raise ValueError(f"attn_mask must be 2D [gpu_batch_size, seq_len], got shape {attn_mask.shape}")
+        if attn_mask.size(0) != gpu_batch_size or attn_mask.size(1) != seq_len:
+            raise ValueError(f"attn_mask shape mismatch: expected [{gpu_batch_size}, {seq_len}], got {list(attn_mask.shape)}")
+
+        attn_mask = attn_mask.to(device=device, non_blocking=True)
+
+        if for_flex:
+            return attn_mask
+
+        # [gpu_batch_size, 1, seq_len, 1]
+        q_valid = attn_mask[:, None, :, None]
+        # [gpu_batch_size, 1, 1, seq_len]
+        k_valid = attn_mask[:, None, None, :]
+        # [gpu_batch_size, 1, seq_len, seq_len]
+        allow_mask_4d = q_valid & k_valid
+        if self.is_causal:
+            allow_causal = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device=device).tril()
+            allow_mask_4d = allow_mask_4d & allow_causal
+        return allow_mask_4d
+
+    def forward(self, indices, targets=None, attn_mask=None, ignore_doc_mask=False, document_ids=None):
+        # ignore_doc_mask to avoid using it in:
+        # val, sampling, hellaswag
+        # even if used in train
+        gpu_batch_size, seq_len = indices.size()
         te = self.transformer.wte(indices)
 
         # if RoPE or NoPE, rotate later in attention or do nothing, respectively
         if self.pos_encoding_type == "rope" or self.pos_encoding_type == "nope":
             x = te
-        # else, apply absolute position encoding
         else:
-            pe = self.transformer.wpe(torch.arange(0, seq_len, dtype=torch.long, device=device))
+            pe = self.transformer.wpe(torch.arange(0, seq_len, dtype=torch.long, device=indices.device))
             x = te + pe
-        
+
+        attn_mask = self._normalize_attn_mask(
+            attn_mask=attn_mask,
+            gpu_batch_size=gpu_batch_size,
+            seq_len=seq_len,
+            device=indices.device,
+            for_flex=self.use_flex_attention,
+        )
+
+        if self.use_flex_attention:
+            flex_attn_block_mask = self._build_flex_attn_block_mask(
+                attn_mask=attn_mask,
+                document_ids=document_ids,
+                gpu_batch_size=gpu_batch_size,
+                seq_len=seq_len,
+                device=indices.device,
+                ignore_doc_mask=ignore_doc_mask
+            )
+            sdpa_attn_mask = None
+        else:
+            flex_attn_block_mask = None
+            sdpa_attn_mask = attn_mask
+
         for block in self.transformer.h:
-            x = block(x, attn_mask=attn_mask)
+            x = block(x, flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
         x = self.transformer.ln_f(x)
 
-        # (gpu_batch_size, seq_len, vocab_size)
-        if torch.isnan(x).any():
-            pass
+        # [gpu_batch_size, seq_len, vocab_size]
         logits = self.lm_head(x)
-
-        # <-- Uncomment for logit soft-capping -->
-        # logits_absmax_pre = logits.detach().abs().amax()
-        # if self.use_lm_head_logit_softcapping:
-        #     logits = softcap_logits(logits, self.lm_head_logit_softcap)
-        #     logits_absmax_post = logits.detach().abs().amax()
-        # else:
-        #     logits_absmax_post = logits_absmax_pre
-
-        # self._logits_absmax_stats = {
-        #     "logits_absmax_pre_capping": logits_absmax_pre,
-        #     "logits_absmax_post_capping": logits_absmax_post,
-        # }
-        # <-- Uncomment for logit soft-capping -->
 
         if targets is not None:
             loss_mask = (targets != self.pad_token_id)
-            # logits are viewed as gpu_batch_size * seq_len, vocab_size
-            # targets as gpu_batch_size * seq_len, as only 1 out of vocab_size tokens is the correct one
-            # do not reduce to mean loss as some losses (from masked tokens) are not to be used
-            # making the loss be of size (gpu_batch_size * seq_len) compared to a scalar if reduced
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-            # instead, get the number of unmasked (non-False) tokens
             n_non_masked_tokens = loss_mask.sum()
-            # multiply unreduced loss by the mask to ingore losses coming from masked tokens and sum them
             sum_non_masked_loss_tokens = (loss * loss_mask.view(-1)).sum()
-            # then manually reduce to the mean loss
             loss = sum_non_masked_loss_tokens / n_non_masked_tokens
         else:
             loss = None
 
         return logits, loss
 
-def get_sample_token_count(step, base=5, step_interval=1000, max_tokens=50):
-    return min(base + (step // step_interval) * base, max_tokens)
-
+################################################
+#                Learning Rate                 #
+################################################
 def get_lr(step):
     if step < warmup_steps:
         return (step + 1) * max_lr / warmup_steps
@@ -866,6 +1096,12 @@ def get_lr(step):
     if hard_min_lr > 0:
         lr = max(lr, hard_min_lr)
     return lr
+
+################################################
+#                   Sampling                   #
+################################################
+def get_sample_token_count(step, base=5, step_interval=1000, max_tokens=50):
+    return min(base + (step // step_interval) * base, max_tokens)
 
 def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_p=None):
     gpt_model.eval()
@@ -887,7 +1123,7 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
         alloc_len = max_input_len + max_new_tokens
 
         # rounding up to a nice multiple for better tensor cores / GPU efficiency
-        round_multiple = 8
+        round_multiple = 128 if raw_gpt_model.use_flex_attention else 8
         alloc_len = math.ceil(alloc_len / round_multiple) * round_multiple
         alloc_len = min(alloc_len, raw_gpt_model.max_seq_len)
 
@@ -911,11 +1147,13 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
             # then, for each new token to generate, update the mask by effectively comparing if 0, ..., alloc_len < the non-padded length for each sequence
             # using unsqueeze(0) to add a new dimension of size 1 at the beginning to give size (1, alloc_len)
             # and unsqueeze(1) to add a new dimension of size 1 at the end to give size (len(sample_sequences), 1)
-            attn_mask = torch.arange(alloc_len, device=device).unsqueeze(0) < actual_sequence_lengths.unsqueeze(1)
+            # attn_mask = torch.arange(alloc_len, device=device).unsqueeze(0) < actual_sequence_lengths.unsqueeze(1)
             
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 # and predict, resulting in (len(sample_sequences), seq_len, vocab_size)
-                logits, _ = gpt_model(generated_sequences, attn_mask=attn_mask)
+                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
+                # so we can skip passing an attn_mask
+                logits, _ = raw_gpt_model(generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
             
             # of which we take the vocab_size values for each sequence's continuation to the last non-pad token,
             # resulting in len(sample_sequences), vocab_size
@@ -1015,6 +1253,9 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
         dist.barrier()
     gpt_model.train()
 
+################################################
+#                   HellaSwag                  #
+################################################
 # ---------------------------------------------------------
 # Normalizing token probabilities to account for sequence length and comparing continuations A-D has the issue of an 
 # easy continuation achieving high scores because once the answer deviates, the continuation is easy to guess, e.g.,
@@ -1151,18 +1392,6 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
     one_shot_correct_label_char = chr(ord('A') + int(one_shot_example['label']))
 
     max_model_seq_len = raw_gpt_model.max_seq_len 
-    
-    pre_allocated_input_ids = torch.full(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        raw_gpt_model.pad_token_id, 
-        dtype=torch.long, 
-        device=device
-    )
-    pre_allocated_attn_mask = torch.zeros(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        dtype=torch.bool, 
-        device=device
-    )
 
     with torch.inference_mode():
         num_example_batches = (total_dataset_examples + hellaswag_examples_per_batch - 1) // hellaswag_examples_per_batch
@@ -1226,15 +1455,31 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
                     all_seq_ids.append(combined_seq_ids)
                     orig_example_indices.append(ex_idx_in_batch)
 
-            pre_allocated_input_ids.fill_(raw_gpt_model.pad_token_id)
-            pre_allocated_attn_mask.zero_()
+            # allocate to the actual max length in this pass (rounded for kernels, capped to model max)
+            max_len_in_batch = max(len(s) for s in all_seq_ids) if all_seq_ids else 1
+            round_multiple = 8
+            alloc_len = min(max_model_seq_len, math.ceil(max_len_in_batch / round_multiple) * round_multiple)
+
+            pre_allocated_input_ids = torch.full(
+                (max_gpu_sequences_per_batch, alloc_len),
+                raw_gpt_model.pad_token_id,
+                dtype=torch.long,
+                device=device
+            )
+            pre_allocated_attn_mask = torch.zeros(
+                (max_gpu_sequences_per_batch, alloc_len),
+                dtype=torch.bool,
+                device=device
+            )
 
             for idx, seq_ids in enumerate(all_seq_ids):
                 pre_allocated_input_ids[idx, :len(seq_ids)] = torch.tensor(seq_ids, dtype=torch.long, device=device)
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, _ = gpt_model(pre_allocated_input_ids, attn_mask=pre_allocated_attn_mask)
+                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
+                # so we can skip passing an attn_mask
+                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             # log softmax: softmax followed by log (to sum log-probs vs. multiply low-value probs)
             log_probs = F.log_softmax(logits, dim=-1)
@@ -1310,18 +1555,6 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
 
     max_model_seq_len = raw_gpt_model.max_seq_len 
     
-    pre_allocated_input_ids = torch.full(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        raw_gpt_model.pad_token_id, 
-        dtype=torch.long, 
-        device=device
-    )
-    pre_allocated_attn_mask = torch.zeros(
-        (max_gpu_sequences_per_batch, max_model_seq_len), 
-        dtype=torch.bool, 
-        device=device
-    )
-
     with torch.inference_mode():
         num_example_batches = (total_dataset_examples + hellaswag_examples_per_batch - 1) // hellaswag_examples_per_batch
 
@@ -1366,15 +1599,31 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
                     orig_example_indices.append(ex_idx_in_batch)
                     prefix_lengths.append(len(context_ids))
 
-            pre_allocated_input_ids.fill_(raw_gpt_model.pad_token_id)
-            pre_allocated_attn_mask.zero_()
+            # allocate to the actual max length in this pass (rounded for kernels, capped to model max)
+            max_len_in_batch = max(len(s) for s in all_seq_ids) if all_seq_ids else 1
+            round_multiple = 8
+            alloc_len = min(max_model_seq_len, math.ceil(max_len_in_batch / round_multiple) * round_multiple)
+
+            pre_allocated_input_ids = torch.full(
+                (max_gpu_sequences_per_batch, alloc_len),
+                raw_gpt_model.pad_token_id,
+                dtype=torch.long,
+                device=device
+            )
+            pre_allocated_attn_mask = torch.zeros(
+                (max_gpu_sequences_per_batch, alloc_len),
+                dtype=torch.bool,
+                device=device
+            )
 
             for idx, seq_ids in enumerate(all_seq_ids):
                 pre_allocated_input_ids[idx, :len(seq_ids)] = torch.tensor(seq_ids, dtype=torch.long, device=device)
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, _ = gpt_model(pre_allocated_input_ids, attn_mask=pre_allocated_attn_mask)
+                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
+                # so we can skip passing an attn_mask
+                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             log_probs = F.log_softmax(logits, dim=-1)
 
@@ -1430,47 +1679,9 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
     gpt_model.train()
     return accuracy
 
-def save_config_info():
-    with open(config_filename, "w") as f:
-        f.write(f"timestamp: {timestamp}\n")
-
-        f.write(f"ddp world size: {ddp_world_size}\n")
-
-        f.write(f"total tokens per step: {total_tokens_per_step}\n")
-        f.write(f"gpu batch size: {gpu_batch_size}\n")
-        f.write(f"seq len: {seq_len}\n")
-        f.write(f"total tokens per mini-step: {total_tokens_per_mini_step}\n")
-        f.write(f"grad accum mini-steps: {grad_accum_mini_steps}\n")
-        
-        f.write(f"betas: {betas}\n")
-        f.write(f"eps: {eps}\n")
-        f.write(f"max lr: {max_lr}\n")
-        f.write(f"min lr after warmup ratio: {min_lr_after_warmup_ratio}\n")
-        f.write(f"warmup tokens: {warmup_tokens}\n")
-        f.write(f"warmup and cosine tokens: {warmup_and_cosine_tokens}\n")
-        f.write(f"max tokens: {max_tokens}\n")
-        f.write(f"weight decay: {weight_decay}\n")
-        f.write(f"hard min lr: {hard_min_lr}\n")
-
-        # derived
-        f.write(f"max steps: {max_steps}\n")
-        f.write(f"min lr after warmup: {min_lr_after_warmup}\n")
-        f.write(f"warmup steps: {warmup_steps}\n")
-        f.write(f"warmup and cosine steps: {warmup_and_cosine_steps}\n")
-
-        f.write(f"base seed: {base_seed}\n")
-        f.write(f"device type: {device_type}\n")
-        f.write(f"tokenizer: gpt2 (tiktoken)\n")
-
-        f.write(f"val target: {val_target}\n")
-        f.write(f"val steps: {val_steps}\n")
-        f.write(f"val interval: {val_interval}\n")
-        f.write(f"sample interval: {sample_interval}\n")
-        f.write(f"train val margin: {train_val_margin}\n")
-
-        for k, v in GPTConfig().__dict__.items():
-            f.write(f"model config - {k}: {v}\n")
-
+################################################
+#                Checkpointing                 #
+################################################
 def keep_latest_checkpoints(checkpoint_dir):
     all_files = os.listdir(checkpoint_dir)
 
@@ -1575,11 +1786,12 @@ def load_checkpoint():
     }
     # print(list(model_state_dict.keys())[:5])
 
-    gpt_model = GPT(GPTConfig())
+    model_cfg = GPTConfig(max_seq_len=max(seq_len_train, seq_len_val))
+    gpt_model = GPT(model_cfg)
     gpt_model.load_state_dict(model_state_dict, strict=False)
 
     # tie weights, creating wte.weight
-    if gpt_model.tied_embeddings:
+    if gpt_model.use_tied_embeddings:
         gpt_model.transformer.wte.weight = gpt_model.lm_head.weight
 
     # load training state
@@ -1604,6 +1816,9 @@ def load_checkpoint():
         gpt_model,
     )
 
+################################################
+#      Initialization & Non-Model Config       #
+################################################
 init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -1618,12 +1833,16 @@ master_process = ddp_rank == 0
 # This ensures training losses are stored only after a checkpointing step happens.
 log_buffer = []
 
-total_tokens_per_step = 2**18 # 2**19 == 524,288 or ~500M tokens from Language Models are Few-Shot Learners
-gpu_batch_size = 64
-seq_len = 1024
-total_tokens_per_mini_step = ddp_world_size * gpu_batch_size * seq_len
-grad_accum_mini_steps = total_tokens_per_step // total_tokens_per_mini_step
-assert total_tokens_per_step % total_tokens_per_mini_step == 0
+total_tokens_per_step_train = 2**18 # 2**19 == 524,288 or ~0.5M tokens from Language Models are Few-Shot Learners
+factor = 2
+gpu_batch_size_train = 64 // factor
+gpu_batch_size_val = 64 // factor
+seq_len_train =  1024 * factor
+seq_len_val = 1024 * factor
+
+total_tokens_per_mini_step_train = ddp_world_size * gpu_batch_size_train * seq_len_train
+grad_accum_mini_steps = total_tokens_per_step_train // total_tokens_per_mini_step_train
+assert total_tokens_per_step_train % total_tokens_per_mini_step_train == 0
 if master_process:
     message = f"per-gpu gradient accumulation mini-steps: {grad_accum_mini_steps}"
     print(message)
@@ -1639,10 +1858,10 @@ max_tokens = 5*10**9
 weight_decay = 0.1
 hard_min_lr = 7e-4
 
-max_steps = max_tokens // total_tokens_per_step
+max_steps = max_tokens // total_tokens_per_step_train
 min_lr_after_warmup = min_lr_after_warmup_ratio * max_lr
-warmup_steps = warmup_tokens // total_tokens_per_step
-warmup_and_cosine_steps = warmup_and_cosine_tokens // total_tokens_per_step
+warmup_steps = warmup_tokens // total_tokens_per_step_train
+warmup_and_cosine_steps = warmup_and_cosine_tokens // total_tokens_per_step_train
 if master_process:
     messages = [
         f"warmup steps: {warmup_steps:,}",
@@ -1661,12 +1880,13 @@ tokenizer = tiktoken.get_encoding("gpt2")
 
 val_target = 3.28
 val_tokens = 2 ** 21 * 5
-val_steps = math.ceil(val_tokens / total_tokens_per_mini_step)
+val_steps = math.ceil(val_tokens / (ddp_world_size * gpu_batch_size_val * seq_len_val))
 val_interval = 50
+total_tokens_per_mini_step_val = ddp_world_size * gpu_batch_size_val * seq_len_val
 if master_process:
-    print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_mini_step:,} tokens per val step)")
+    print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_mini_step_val:,} tokens per val step)")
 # to save compute, start running validation when training loss + train_val_margin <= val_target
-train_val_margin = 0.03
+train_val_margin = 0.05
 allow_val = False
 
 sample_interval = 4000
@@ -1727,6 +1947,10 @@ seed = base_seed + ddp_rank
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
+################################################
+#           Model Building / Loading           #
+################################################
+model_cfg = GPTConfig(max_seq_len=max(seq_len_train, seq_len_val))
 if resume_from_checkpoint:
     # get start_step, train dataloader config (epoch, grad_accum_mini_steps_per_shard_counter, etc.),
     # optimizer state and model
@@ -1743,6 +1967,7 @@ if resume_from_checkpoint:
     # move the downloaded gpt_model to device, compile it, set up DDP, and set raw_gpt_model to create the optimizer
     # based on the downloaded model
     gpt_model.to(device)
+    #gpt_model = torch.compile(gpt_model, mode="max-autotune", fullgraph=True, dynamic=False)
     gpt_model = torch.compile(gpt_model)
     gpt_model = DDP(gpt_model, device_ids=[ddp_local_rank])
     raw_gpt_model = gpt_model.module
@@ -1758,23 +1983,40 @@ if resume_from_checkpoint:
     # wait for all ranks to sync
     dist.barrier()
 else:
-    gpt_model = GPT(GPTConfig())
+    gpt_model = GPT(model_cfg)
     gpt_model.to(device)
+    #gpt_model = torch.compile(gpt_model, mode="max-autotune", fullgraph=True, dynamic=False)
     gpt_model = torch.compile(gpt_model)
     gpt_model = DDP(gpt_model, device_ids=[ddp_local_rank])
     raw_gpt_model = gpt_model.module
     optimizers = raw_gpt_model.configure_optimizers(max_lr, betas, eps, weight_decay, device_type)
 
+################################################
+#             DataLoader Building              #
+################################################
 data_path = "./data/edu_fineweb10B"
+# shuffle or first 10_485_760 tokens of the FineWeb validation shard for the NanoGPT Speedrun
+shuffle_val_tokens = True
 # if resume_from_checkpoint: epoch, current_shard_idx, and grad_accum_mini_steps_per_shard_counter are overriden
 # above and thus set to non-zero values in the DataLoader()
-train_data_loader = DataLoader(gpu_batch_size, seq_len, ddp_world_size, ddp_rank, data_path, "train",
-                               epoch=epoch, current_shard_idx=current_shard_idx,
-                               grad_accum_mini_steps_per_shard_counter=grad_accum_mini_steps_per_shard_counter)
-val_data_loader = DataLoader(gpu_batch_size, seq_len, ddp_world_size, ddp_rank, data_path, "val",
-                             epoch=0, current_shard_idx=0,
-                             grad_accum_mini_steps_per_shard_counter=0)
+train_data_loader = DataLoader(
+    gpu_batch_size_train, seq_len_train, ddp_world_size, ddp_rank, data_path, "train",
+    epoch=epoch, current_shard_idx=current_shard_idx,
+    grad_accum_mini_steps_per_shard_counter=grad_accum_mini_steps_per_shard_counter,
+    pad_token_id=model_cfg.pad_token_id, eos_token_id=model_cfg.eos_token_id,
+    return_document_ids=raw_gpt_model.use_doc_masking,
+)
+val_data_loader = DataLoader(
+    gpu_batch_size_val, seq_len_val, ddp_world_size, ddp_rank, data_path, "val",
+    epoch=0, current_shard_idx=0, grad_accum_mini_steps_per_shard_counter=0,
+    pad_token_id=model_cfg.pad_token_id, eos_token_id=model_cfg.eos_token_id,
+    return_document_ids=raw_gpt_model.use_doc_masking,
+    shuffle_val_tokens=shuffle_val_tokens,
+)
 
+################################################
+# HellaSwag Loading and Splitting across gpus  #
+################################################
 # load HellaSwag and split it across all GPUs similar to how the train DataLoader assigns different chunks to each GPU
 hellaswag_train_dataset = load_dataset("hellaswag", split="train")
 hellaswag_val_dataset = load_dataset("hellaswag", split="validation")
@@ -1794,15 +2036,228 @@ if master_process:
     log_buffer.extend(all_messages)
 dist.barrier()
 
+################################################
+#             Config Saving to file            #
+################################################
+def save_config_info():
+    with open(config_filename, "w") as f:
+        f.write(f"timestamp: {timestamp}\n")
+
+        f.write(f"ddp world size: {ddp_world_size}\n")
+
+        f.write(f"total tokens per step (train): {total_tokens_per_step_train}\n")
+        f.write(f"gpu batch size (train): {gpu_batch_size_train}\n")
+        f.write(f"gpu batch size (val): {gpu_batch_size_val}\n")
+        f.write(f"seq len (train): {seq_len_train}\n")
+        f.write(f"seq len (val): {seq_len_val}\n")
+        f.write(f"total tokens per mini-step (train): {total_tokens_per_mini_step_train}\n")
+        f.write(f"grad accum mini-steps: {grad_accum_mini_steps}\n")
+        f.write(f"total tokens per mini-step (val): {total_tokens_per_mini_step_val}\n")
+        
+        f.write(f"betas: {betas}\n")
+        f.write(f"eps: {eps}\n")
+        f.write(f"max lr: {max_lr}\n")
+        f.write(f"min lr after warmup ratio: {min_lr_after_warmup_ratio}\n")
+        f.write(f"warmup tokens: {warmup_tokens}\n")
+        f.write(f"warmup and cosine tokens: {warmup_and_cosine_tokens}\n")
+        f.write(f"max tokens: {max_tokens}\n")
+        f.write(f"weight decay: {weight_decay}\n")
+        f.write(f"hard min lr: {hard_min_lr}\n")
+
+        # derived
+        f.write(f"max steps: {max_steps}\n")
+        f.write(f"min lr after warmup: {min_lr_after_warmup}\n")
+        f.write(f"warmup steps: {warmup_steps}\n")
+        f.write(f"warmup and cosine steps: {warmup_and_cosine_steps}\n")
+
+        f.write(f"base seed: {base_seed}\n")
+        f.write(f"device type: {device_type}\n")
+        f.write(f"tokenizer: gpt2 (tiktoken)\n")
+
+        f.write(f"shuffle val tokens: {shuffle_val_tokens}\n")
+        f.write(f"val target: {val_target}\n")
+        f.write(f"val steps: {val_steps}\n")
+        f.write(f"val interval: {val_interval}\n")
+        f.write(f"sample interval: {sample_interval}\n")
+        f.write(f"train val margin: {train_val_margin}\n")
+
+        for k, v in model_cfg.__dict__.items():
+            f.write(f"model config - {k}: {v}\n")
+
 if master_process:
     save_config_info()
 
+################################################
+#              Parameter Logging               #
+################################################
 # 50304*768 + 1024*768 + 12*2*(768+768) + 12*(768*3*768 + 3*768) + 12*(768*768 + 768) + 12*(768*4*768 + 4*768) + 12*(768*4*768 + 768) + 768 + 768
 if master_process:
     message = f"{sum(p.numel() for p in gpt_model.parameters() if p.requires_grad):,} parameters"
     print(message)
     log_buffer.append(message)
 
+################################################
+#                Kernel Warmup                 #
+################################################
+def _kernel_warmup(num_train_steps=2):
+    # snapshot everything so we don't "cheat"
+    model_state = copy.deepcopy(raw_gpt_model.state_dict())
+    optimizer_states = {k: copy.deepcopy(opt.state_dict()) for k, opt in optimizers.items()}
+    rng_state_cpu = torch.get_rng_state()
+    rng_state_cuda = torch.cuda.get_rng_state()
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # train-shape warmup (compile both DDP graphs)
+    gpt_model.train()
+    with torch.enable_grad():
+        for _ in range(num_train_steps):
+            for optimizer in optimizers.values():
+                optimizer.zero_grad(set_to_none=True)
+
+            for mini_step in range(grad_accum_mini_steps):
+                # mimic the real training loop’s DDP behavior
+                gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
+
+                # make shapes match training
+                x_train = torch.randint(
+                    0, raw_gpt_model.pad_token_id,
+                    (gpu_batch_size_train, seq_len_train), device=device
+                )
+                y_train = torch.randint(
+                    0, raw_gpt_model.pad_token_id,
+                    (gpu_batch_size_train, seq_len_train), device=device
+                )
+
+                # synthesize doc_ids so the doc-masking + SWA FlexAttention path compiles
+                if raw_gpt_model.use_doc_masking:
+                    # set random-ish EOS boundaries
+                    step = max(16, seq_len_train // 8)
+                    idxs = torch.arange(seq_len_train, device=device)[None, :]
+                    rand_offsets = torch.randint(0, step, (gpu_batch_size_train, 1), device=device)
+                    is_eos = ((idxs + rand_offsets) % step == 0)
+                    doc_ids_train = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+                else:
+                    doc_ids_train = None
+
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    _, warm_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+
+                (warm_loss / grad_accum_mini_steps).backward()
+
+            for optimizer in optimizers.values():
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # val-shape warmup (compile eval forward)
+    gpt_model.eval()
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        x_val = torch.randint(
+            0, raw_gpt_model.pad_token_id,
+            (gpu_batch_size_val, seq_len_val), device=device
+        )
+        y_val = torch.randint(
+            0, raw_gpt_model.pad_token_id,
+            (gpu_batch_size_val, seq_len_val), device=device
+        )
+        if raw_gpt_model.use_doc_masking:
+            step = max(16, seq_len_val // 8)
+            idxs = torch.arange(seq_len_val, device=device)[None, :]
+            rand_offsets = torch.randint(0, step, (gpu_batch_size_val, 1), device=device)
+            is_eos = ((idxs + rand_offsets) % step == 0)
+            doc_ids_val = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+        else:
+            doc_ids_val = None
+
+        _ = gpt_model(x_val, y_val, document_ids=doc_ids_val)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # sampling-shape warmup
+    raw_gpt_model.eval()
+    max_new_tokens = get_sample_token_count(start_step)
+    max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
+    initial_input_ids_list = [
+        tokenizer.encode(sequence)[:max_allowed_input_len] 
+        for sequence in sample_sequences
+    ]
+    max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
+    alloc_len = max_input_len + max_new_tokens
+    round_multiple = 128 if raw_gpt_model.use_flex_attention else 8
+    alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
+
+    sampling_input_ids = torch.full(
+        (len(sample_sequences), alloc_len),
+        raw_gpt_model.pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+    for i, ids in enumerate(initial_input_ids_list):
+        if ids:
+            sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        _ = raw_gpt_model(
+            sampling_input_ids,
+            attn_mask=None,
+            ignore_doc_mask=True,
+            document_ids=None,
+        )
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # hellaswag-shape warmup
+    raw_gpt_model.eval()
+    hellaswag_examples_per_batch = 16
+    max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
+
+    alloc_len = min(1024, raw_gpt_model.max_seq_len)
+
+    pre_allocated_input_ids = torch.full(
+        (max_gpu_sequences_per_batch, alloc_len),
+        raw_gpt_model.pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        _ = raw_gpt_model(
+            pre_allocated_input_ids,
+            attn_mask=None,
+            ignore_doc_mask=True,
+            document_ids=None,
+        )
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # restore state
+    raw_gpt_model.load_state_dict(model_state)
+    for k, optimizer in optimizers.items():
+        optimizer.load_state_dict(optimizer_states[k])
+    torch.set_rng_state(rng_state_cpu)
+    torch.cuda.set_rng_state(rng_state_cuda)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+_kernel_warmup(num_train_steps=2)
+
+##################################################################
+#  Training, Validation, Sampling, HellaSwag, Checkpointing loop #
+##################################################################
 try:
     for step in range(start_step, max_steps):
         
@@ -1816,12 +2271,14 @@ try:
 
         # per-gpu grad accumulation mini-steps
         for mini_step in range(grad_accum_mini_steps):
-            x_train, y_train = train_data_loader.next_batch()
+            x_train, y_train, doc_ids_train = train_data_loader.next_batch()
             x_train = x_train.pin_memory().to(device, non_blocking=True)
             y_train = y_train.pin_memory().to(device, non_blocking=True)
+            if doc_ids_train is not None:
+                doc_ids_train = doc_ids_train.pin_memory().to(device, non_blocking=True)
             gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, step_train_loss = gpt_model(x_train, y_train)
+                logits, step_train_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
             step_train_loss /= grad_accum_mini_steps
             train_loss += step_train_loss.detach()
             step_train_loss.backward()
@@ -1902,15 +2359,15 @@ try:
             # the scale is constant across ranks because it is head-dependant, and all
             # gpus share the heads (even though with different data)
             qk_suffix = ""
-            if raw_gpt_model.qk_norm and raw_gpt_model.qk_debug_log:
+            if raw_gpt_model.use_qk_norm and raw_gpt_model.use_qk_debug_log:
                 qk_suffix = " | " + qk_scale_debug_string(raw_gpt_model)
-            train_tokens_processed += (grad_accum_mini_steps * total_tokens_per_mini_step)
+            train_tokens_processed += (grad_accum_mini_steps * total_tokens_per_mini_step_train)
             train_log_content = (
                 f"step: {step:,} | train loss: {tl:.8f} | "
                 f"train ppl: {math.exp(tl):,.2f} | "
                 f"train step time: {1000*(train_step_t):,.2f} ms | "
                 # f"grad norm: {grad_norm_text} | lr: {lr:.8f} | "
-                f"tok/s: {ddp_world_size * grad_accum_mini_steps * gpu_batch_size * seq_len / train_step_t:,.2f} | "
+                f"tok/s: {total_tokens_per_step_train / train_step_t:,.2f} | "
                 f"total toks: {train_tokens_processed:,} | total time: {total_t/60:,.2f} min"
                 f"{qk_suffix}"
                 # f"{logits_suffix}"
@@ -1957,7 +2414,7 @@ try:
                 print(message)
                 log_buffer.append(message)
         
-        if allow_val and (step % val_interval == 0 and step > 0) or step == max_steps - 1:
+        if (allow_val and (step % val_interval == 0 and step > 0)) or step == max_steps - 1:
             torch.cuda.synchronize()
             start_val_t = time.time()
             gpt_model.eval()
@@ -1969,11 +2426,13 @@ try:
             with torch.inference_mode():
                 val_loss = 0.0
                 for _ in range(val_steps):
-                    x_val, y_val = val_data_loader.next_batch()
+                    x_val, y_val, doc_ids_val = val_data_loader.next_batch()
                     x_val = x_val.pin_memory().to(device, non_blocking=True)
                     y_val = y_val.pin_memory().to(device, non_blocking=True)
+                    if doc_ids_val is not None:
+                        doc_ids_val = doc_ids_val.pin_memory().to(device, non_blocking=True)
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        _, step_val_loss = gpt_model(x_val, y_val)
+                        _, step_val_loss = gpt_model(x_val, y_val, document_ids=doc_ids_val)
                     val_loss += step_val_loss / val_steps
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
 

@@ -1434,7 +1434,7 @@ master_process = ddp_rank == 0
 # This ensures training losses are stored only after a checkpointing step happens.
 log_buffer = []
 
-total_tokens_per_step = 2**18 # 2**19 == 524,288 or ~500M tokens from Language Models are Few-Shot Learners
+total_tokens_per_step = 2**18 # 2**19 == 524,288 or ~0.5M tokens from Language Models are Few-Shot Learners
 gpu_batch_size = 64
 seq_len = 1024
 total_tokens_per_mini_step = ddp_world_size * gpu_batch_size * seq_len
