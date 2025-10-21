@@ -1882,9 +1882,9 @@ val_target = 3.28
 val_tokens = 2 ** 21 * 5
 val_steps = math.ceil(val_tokens / (ddp_world_size * gpu_batch_size_val * seq_len_val))
 val_interval = 50
-total_tokens_per_mini_step_val = ddp_world_size * gpu_batch_size_val * seq_len_val
+total_tokens_per_step_val = ddp_world_size * gpu_batch_size_val * seq_len_val
 if master_process:
-    print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_mini_step_val:,} tokens per val step)")
+    print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_step_val:,} tokens per val step)")
 # to save compute, start running validation when training loss + train_val_margin <= val_target
 train_val_margin = 0.05
 allow_val = False
@@ -2052,7 +2052,7 @@ def save_config_info():
         f.write(f"seq len (val): {seq_len_val}\n")
         f.write(f"total tokens per mini-step (train): {total_tokens_per_mini_step_train}\n")
         f.write(f"grad accum mini-steps: {grad_accum_mini_steps}\n")
-        f.write(f"total tokens per mini-step (val): {total_tokens_per_mini_step_val}\n")
+        f.write(f"total tokens per step (val): {total_tokens_per_step_val}\n")
         
         f.write(f"betas: {betas}\n")
         f.write(f"eps: {eps}\n")
