@@ -1244,9 +1244,9 @@ class GPT(nn.Module):
             num_only_partially_valid_kv_blocks, only_partial_kv_indices = map_to_ordered(blockmask_any & ~blockmask_all)
             num_fully_valid_kv_blocks, fully_valid_kv_indices = map_to_ordered(blockmask_all)
 
-            # when using block_size, window_size is not exact (e.g., 2 full blocks + 1 partial block attended to,
-            # in general, for block_size = 128 and window_size = 384 (window_size_blocks = 3)
-            # excluding doc and other attn masks, but that means 128 + 128 + 64 attended to tokens (64 tokens short)
+            # when using block_size, window_size is not exact (e.g., 2 full blocks + 1 partial block attended to
+            # -in general, for block_size = 128 and window_size = 384 (window_size_blocks = 3)
+            # excluding doc and other attn masks, that means 128 + 128 + 64 attended to tokens (64 tokens short))-
             if sliding_enabled:
                 window_size_blocks = int(math.ceil(window_size / block_size))
             else:
