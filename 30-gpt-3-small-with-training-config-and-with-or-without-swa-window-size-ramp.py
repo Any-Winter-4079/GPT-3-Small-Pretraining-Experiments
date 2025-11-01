@@ -2329,7 +2329,11 @@ def load_checkpoint() -> Tuple[
     torch.Tensor,                       # torch_rng_state_cpu
     torch.Tensor,                       # torch_rng_state_cuda
     int,                                # train_tokens_processed
-    float, float, float, float, float,  # total_train_t, total_val_t, total_sample_t, total_hellaswag_t, total_t
+    float,                              # total_train_t
+    float,                              # total_val_t
+    float,                              # total_sample_t
+    float,                              # total_hellaswag_t
+    float,                              # total_t
     float,                              # best_val_loss
     int,                                # epoch
     int,                                # current_shard_idx
