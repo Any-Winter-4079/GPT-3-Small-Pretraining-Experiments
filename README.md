@@ -47,6 +47,7 @@ This repo supports toggling between the following config options:
 ## Possible improvements
 
 - FP8 matmul config option (run in FP8 independently for Attention, MLP, LM head)
+- KV cache (for `sample`)
 - Mixture of Experts config option
 - Masked Language Model (MLM) training support (`is_causal=False` -> work as encoder)
 - Faster validation:
