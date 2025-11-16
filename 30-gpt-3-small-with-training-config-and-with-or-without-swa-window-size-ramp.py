@@ -58,18 +58,18 @@ class GPTConfig:
     # k_proj: (d_model → n_kv_heads * head_size)
     # when d_model is split, the more (q) heads, the smaller the head_size, which is reused for k, v
     n_heads: int = 12
-    n_kv_heads: int = 4
+    n_kv_heads: int = 12
     use_flex_attention: bool = True # True for FlexAttention or False for SDPA
     flex_block_size: int = 128
     # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
-    use_doc_masking: bool = True
+    use_doc_masking: bool = False
     use_sliding_window_attention: bool = True # True for Sliding Window (local) Attention (e.g., Mistral-style)
     use_sliding_window_size_ramp: bool = True # True to ramp SWA window size up or False for fixed window size
     sliding_window_size_ramp_steps: int = 1650 # steps over which to linearly increase window size (only used if use_sliding_window_size_ramp=True)
     # window size defines the number of most-recent keys a query can attend to (only used if use_sliding_window_attention=True)
-    sliding_window_min_size: int = 256 # sliding window size at the start of training (only used if use_sliding_window_size_ramp=True)
+    sliding_window_min_size: int = 128 # sliding window size at the start of training (only used if use_sliding_window_size_ramp=True)
     sliding_window_max_size: int = 1024 # constant window size (if use_sliding_window_size_ramp=False), or final window size (if use_sliding_window_size_ramp=True)
-    enforce_even_blocks: bool = True # this *can* increase the window past its max to fit even block count
+    enforce_even_blocks: bool = False # this *can* increase the window past its max to fit even block count
     use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
     attn_logit_softcap: float = 15.0
     tanh_backend: str = "ptx" # "clamp", "ptx" (faster) or "rational" or "exact"
@@ -85,7 +85,7 @@ class GPTConfig:
     rope_base_theta: int = 500_000
 
     # MLP activations
-    activation: str = "swiglu" # "gelu", "relu", "relu2" (relu^2), "silu" or "swiglu"
+    activation: str = "relu2" # "gelu", "relu", "relu2" (relu^2), "silu" or "swiglu"
     use_fair_swiglu: bool = True # only if swiglu
 
     # lm head logit soft-capping
@@ -135,7 +135,7 @@ class TrainingConfig:
     optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
     muon_lr_scale: float = 0.15 # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
     muon_backend: str = 'newtonschulz5'
-    muon_backend_steps: int = 8 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+    muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
     muon_momentum: float = 0.95
     muon_use_nesterov: bool = True
     # derived from the above
