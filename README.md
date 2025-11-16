@@ -4,7 +4,7 @@ This repo starts coding along [Let's reproduce GPT-2 (124M)](https://www.youtube
 
 ## Measurements
 
-- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens: 6.93 minutes ([config](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251102_154958/blob/main/config.txt), [log](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251102_154958/raw/main/log.txt)) (4x NVIDIA H100s -we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
+- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens: 5.66 minutes ([config](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251116_141824/blob/main/config.txt), [log](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251116_141824/blob/main/log.txt)) (4x NVIDIA H100s -we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
 - [Nov 2, 2025, World record <= 3.28 val loss on _the first_ 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history): 2.345 minutes (8x NVIDIA H100s)
 
 ### WR vs This Repo Differences
