@@ -53,29 +53,25 @@ This repo supports toggling between the following config options:
 - Faster validation:
 
 ```
-new best val loss: 3.30998421
-step: 1,850 | val loss: 3.30998421 | val ppl: 27.38 | val time: 9,912.82 ms
+new best val loss: 3.31012869
+step: 1,750 | val loss: 3.31012869 | val ppl: 27.39 | val time: 2,799.90 ms
 ...
-new best val loss: 3.30172825
-step: 1,900 | val loss: 3.30172825 | val ppl: 27.16 | val time: 10,609.94 ms
+new best val loss: 3.30101728
+step: 1,800 | val loss: 3.30101728 | val ppl: 27.14 | val time: 2,758.06 ms
 ...
-new best val loss: 3.29302740
-step: 1,950 | val loss: 3.29302740 | val ppl: 26.92 | val time: 10,428.33 ms
+new best val loss: 3.29165697
+step: 1,850 | val loss: 3.29165697 | val ppl: 26.89 | val time: 2,745.29 ms
 ...
-new best val loss: 3.28548479
-step: 2,000 | val loss: 3.28548479 | val ppl: 26.72 | val time: 8,624.59 ms
+new best val loss: 3.28255892
+step: 1,900 | val loss: 3.28255892 | val ppl: 26.64 | val time: 2,786.11 ms
 ```
 
 - Faster shard-switching (100M tokens/shard) time:
 
 ```
-step: 379 | train loss: 3.87849402 | train ppl: 48.35 | train step time: 174.68 ms | adamw lr: 0.00484023 | tok/s: 1,500,722.21 | total toks: 99,614,720 | total time: 1.07 min | sw size: 512 | max q_scale raw/eff: 1.6959/1.6959 | max k_scale raw/eff: 1.7962/1.7962
-step: 380 | train loss: 3.93908834 | train ppl: 51.37 | train step time: 175.82 ms | adamw lr: 0.00483939 | tok/s: 1,490,972.39 | total toks: 99,876,864 | total time: 1.08 min | sw size: 512 | max q_scale raw/eff: 1.6955/1.6955 | max k_scale raw/eff: 1.7964/1.7964
-step: 381 | train loss: 3.90186548 | train ppl: 49.49 | train step time: 529.26 ms | adamw lr: 0.00483856 | tok/s: 495,301.83 | total toks: 100,139,008 | total time: 1.08 min | sw size: 512 | max q_scale raw/eff: 1.6958/1.6958 | max k_scale raw/eff: 1.7964/1.7964
-step: 382 | train loss: 3.93979096 | train ppl: 51.41 | train step time: 674.42 ms | adamw lr: 0.00483772 | tok/s: 388,695.27 | total toks: 100,401,152 | total time: 1.10 min | sw size: 512 | max q_scale raw/eff: 1.6954/1.6954 | max k_scale raw/eff: 1.7961/1.7961
-step: 383 | train loss: 3.94303560 | train ppl: 51.57 | train step time: 185.77 ms | adamw lr: 0.00483688 | tok/s: 1,411,104.72 | total toks: 100,663,296 | total time: 1.10 min | sw size: 512 | max q_scale raw/eff: 1.6958/1.6958 | max k_scale raw/eff: 1.7959/1.7959
-step: 384 | train loss: 4.02747297 | train ppl: 56.12 | train step time: 176.83 ms | adamw lr: 0.00483604 | tok/s: 1,482,488.92 | total toks: 100,925,440 | total time: 1.10 min | sw size: 512 | max q_scale raw/eff: 1.6954/1.6954 | max k_scale raw/eff: 1.7954/1.7954
-step: 385 | train loss: 3.88525677 | train ppl: 48.68 | train step time: 174.83 ms | adamw lr: 0.00483519 | tok/s: 1,499,416.51 | total toks: 101,187,584 | total time: 1.10 min | sw size: 512 | max q_scale raw/eff: 1.6955/1.6955 | max k_scale raw/eff: 1.7953/1.7953
+step: 380 | train loss: 3.99275875 | train ppl: 54.20 | train step time: 158.82 ms | adamw lr: 0.00483939 | tok/s: 1,650,578.83 | total toks: 99,876,864 | total time: 0.99 min | sw size: 256 | max q_scale raw/eff: 1.8034/1.8034 | max k_scale raw/eff: 1.8034/1.8034
+step: 381 | train loss: 3.94825888 | train ppl: 51.85 | train step time: 251.45 ms | adamw lr: 0.00483856 | tok/s: 1,042,512.27 | total toks: 100,139,008 | total time: 1.00 min | sw size: 256 | max q_scale raw/eff: 1.8039/1.8039 | max k_scale raw/eff: 1.8039/1.8039
+step: 382 | train loss: 3.97589111 | train ppl: 53.30 | train step time: 159.01 ms | adamw lr: 0.00483772 | tok/s: 1,648,631.07 | total toks: 100,401,152 | total time: 1.00 min | sw size: 256 | max q_scale raw/eff: 1.8043/1.8043 | max k_scale raw/eff: 1.8043/1.8043
 ```
 
 - Reward >1 token at the start of training (e.g., I went `swimming` -> reward `swimming`, `running`, `walking`, etc.) and sharpen signal as training goes on
@@ -237,27 +233,15 @@ torchrun --standalone --nproc_per_node=4 30.py
 You should see a log similar to:
 
 ```
-W1102 15:49:55.475000 3485 torch/distributed/run.py:766]
-W1102 15:49:55.475000 3485 torch/distributed/run.py:766] *****************************************
-W1102 15:49:55.475000 3485 torch/distributed/run.py:766] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
-W1102 15:49:55.475000 3485 torch/distributed/run.py:766] *****************************************
 per-gpu gradient accumulation mini-steps: 1
 lr warmup steps: 0
 lr warmup and cosine steps: 3,051
 max train steps: 19,073
-10,485,760 val tokens to be consumed in 40 steps (262,144 tokens per val step)
-num decayed parameter tensors (AdamW): 25, with 38,633,664 parameters
+num decayed parameter tensors (AdamW): 25, with 38,633,760 parameters
 num non-decayed parameter tensors (AdamW): 25, with 19,200 parameters
-num Muon parameter tensors: 72, with 75,497,472 parameters
+num Muon parameter tensors: 72, with 84,934,656 parameters
 using fused AdamW: True
 found 99 shards for split train
-README.md: 7.02kB [00:00, 15.1MB/s]
-data/train-00000-of-00001.parquet: 100%|███████████████████████████████████████████████████████████████████████████████| 24.4M/24.4M [00:00<00:00, 33.8MB/s]
-data/test-00000-of-00001.parquet: 100%|████████████████████████████████████████████████████████████████████████████████| 6.11M/6.11M [00:00<00:00, 19.6MB/s]
-data/validation-00000-of-00001.parquet: 100%|██████████████████████████████████████████████████████████████████████████| 6.32M/6.32M [00:00<00:00, 23.5MB/s]
-Generating train split: 100%|██████████████████████████████████████████████████████████████████████████████| 39905/39905 [00:00<00:00, 301180.80 examples/s]
-Generating test split: 100%|███████████████████████████████████████████████████████████████████████████████| 10003/10003 [00:00<00:00, 328932.14 examples/s]
-Generating validation split: 100%|█████████████████████████████████████████████████████████████████████████| 10042/10042 [00:00<00:00, 311047.11 examples/s]
 total train shard 0 tokens: 99,876,865
 total gpus: 4
 gpu batch size: 8 sequences
@@ -265,28 +249,28 @@ sequence length: 8,192 tokens
 tokens fed to gpu per grad accum mini-step: 65,536 (4 gpus, 262,144 total tokens)
 per-gpu grad accumulation mini-steps for train shard 0 (each mini-step processing 262,144 tokens): 381
 found 1 shards for split val
-[rank 2] gets HellaSwag sentences 5,022 to 7,532
-[rank 3] gets HellaSwag sentences 7,533 to 10,041
 total val shard 0 tokens: 99,876,865
 total gpus: 4
 gpu batch size: 8 sequences
 sequence length: 8,192 tokens
 tokens fed to gpu per grad accum mini-step: 65,536 (4 gpus, 262,144 total tokens)
 per-gpu grad accumulation mini-steps for val shard 0 (each mini-step processing 262,144 tokens): 381
-[rank 1] gets HellaSwag sentences 2,511 to 5,021
 [rank 0] gets HellaSwag sentences 0 to 2,510
-training and model configs saved to ./configs_and_logs/20251102_154958/config.txt
-114,150,336 parameters
+[rank 1] gets HellaSwag sentences 2,511 to 5,021
+[rank 2] gets HellaSwag sentences 5,022 to 7,532
+[rank 3] gets HellaSwag sentences 7,533 to 10,041
+123,587,616 parameters
 ```
 
 Then the code takes 2-4 minutes to compile, and then:
 
 ```
-step: 0 | train loss: 10.98035240 | train ppl: 58,709.24 | train step time: 171.81 ms | adamw lr: 0.00500000 | tok/s: 1,525,741.15 | total toks: 262,144 | total time: 0.00 min | sw size: 256 | max q_scale raw/eff: 1.0045/1.0045 | max k_scale raw/eff: 1.0045/1.0045
-step: 1 | train loss: 10.25063896 | train ppl: 28,300.62 | train step time: 166.76 ms | adamw lr: 0.00500000 | tok/s: 1,571,963.77 | total toks: 524,288 | total time: 0.01 min | sw size: 256 | max q_scale raw/eff: 1.0090/1.0090 | max k_scale raw/eff: 1.0090/1.0090
-step: 2 | train loss: 8.28910255 | train ppl: 3,980.26 | train step time: 166.57 ms | adamw lr: 0.00500000 | tok/s: 1,573,775.03 | total toks: 786,432 | total time: 0.01 min | sw size: 256 | max q_scale raw/eff: 1.0130/1.0130 | max k_scale raw/eff: 1.0122/1.0122
-step: 3 | train loss: 8.08094215 | train ppl: 3,232.28 | train step time: 167.56 ms | adamw lr: 0.00499999 | tok/s: 1,564,477.46 | total toks: 1,048,576 | total time: 0.01 min | sw size: 256 | max q_scale raw/eff: 1.0166/1.0166 | max k_scale raw/eff: 1.0154/1.0154
-step: 4 | train loss: 8.21518803 | train ppl: 3,696.67 | train step time: 165.34 ms | adamw lr: 0.00499998 | tok/s: 1,585,436.96 | total toks: 1,310,720 | total time: 0.01 min | sw size: 256 | max q_scale raw/eff: 1.0196/1.0196 | max k_scale raw/eff: 1.0184/1.0184
+step: 0 | train loss: 10.97804832 | train ppl: 58,574.12 | train step time: 216.32 ms | adamw lr: 0.00500000 | tok/s: 1,211,858.15 | total toks: 262,144 | total time: 0.00 min | sw size: 128 | max q_scale raw/eff: 1.0045/1.0045 | max k_scale raw/eff: 1.0045/1.0045
+step: 1 | train loss: 8.87146950 | train ppl: 7,125.74 | train step time: 153.80 ms | adamw lr: 0.00500000 | tok/s: 1,704,460.43 | total toks: 524,288 | total time: 0.01 min | sw size: 128 | max q_scale raw/eff: 1.0090/1.0090 | max k_scale raw/eff: 1.0090/1.0090
+step: 2 | train loss: 7.93997669 | train ppl: 2,807.30 | train step time: 155.61 ms | adamw lr: 0.00500000 | tok/s: 1,684,600.25 | total toks: 786,432 | total time: 0.01 min | sw size: 128 | max q_scale raw/eff: 1.0130/1.0130 | max k_scale raw/eff: 1.0130/1.0130
+step: 3 | train loss: 8.02733135 | train ppl: 3,063.56 | train step time: 154.30 ms | adamw lr: 0.00499999 | tok/s: 1,698,903.45 | total toks: 1,048,576 | total time: 0.01 min | sw size: 128 | max q_scale raw/eff: 1.0158/1.0158 | max k_scale raw/eff: 1.0158/1.0158
+step: 4 | train loss: 7.80339432 | train ppl: 2,448.90 | train step time: 155.14 ms | adamw lr: 0.00499998 | tok/s: 1,689,747.02 | total toks: 1,310,720 | total time: 0.01 min | sw size: 128 | max q_scale raw/eff: 1.0177/1.0177 | max k_scale raw/eff: 1.0177/1.0177
+step: 5 | train loss: 7.81453323 | train ppl: 2,476.33 | train step time: 154.13 ms | adamw lr: 0.00499997 | tok/s: 1,700,782.44 | total toks: 1,572,864 | total time: 0.02 min | sw size: 128 | max q_scale raw/eff: 1.0202/1.0202 | max k_scale raw/eff: 1.0201/1.0201
 ...
 ```
 
