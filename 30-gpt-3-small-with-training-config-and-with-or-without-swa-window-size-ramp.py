@@ -100,10 +100,6 @@ class GPTConfig:
     # gradient_clipping_norm: float = 1.0
     # <-- Uncomment for gradient norm clipping -->
 
-    # derived model config
-    sliding_window_max_blocks: int = field(init=False)
-    sliding_window_min_blocks: int = field(init=False)
-
 @dataclass
 class TrainingConfig:
     # steps and tokens
