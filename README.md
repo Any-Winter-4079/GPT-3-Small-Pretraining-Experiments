@@ -4,7 +4,7 @@ This repo starts coding along [Let's reproduce GPT-2 (124M)](https://www.youtube
 
 ## Measurements
 
-- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens: 5.66 minutes ([config](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251116_141824/blob/main/config.txt), [log](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251116_141824/blob/main/log.txt)) (4x NVIDIA H100s -we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
+- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens: 5.12 minutes ([config](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_132444/blob/main/config.txt), [log](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_132444/raw/main/log.txt)) (4x NVIDIA H100s -we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
 - [Nov 2, 2025, World record <= 3.28 val loss on _the first_ 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history): 2.345 minutes (8x NVIDIA H100s)
 
 ### WR vs This Repo Differences
@@ -46,25 +46,9 @@ This repo supports toggling between the following config options:
 
 ## Possible improvements
 
-- FP8 matmul config option (run in FP8 independently for Attention, MLP, LM head)
 - KV cache (for `sample`)
 - Mixture of Experts config option
 - Masked Language Model (MLM) training support (`is_causal=False` -> work as encoder)
-- Faster validation:
-
-```
-new best val loss: 3.31012869
-step: 1,750 | val loss: 3.31012869 | val ppl: 27.39 | val time: 2,799.90 ms
-...
-new best val loss: 3.30101728
-step: 1,800 | val loss: 3.30101728 | val ppl: 27.14 | val time: 2,758.06 ms
-...
-new best val loss: 3.29165697
-step: 1,850 | val loss: 3.29165697 | val ppl: 26.89 | val time: 2,745.29 ms
-...
-new best val loss: 3.28255892
-step: 1,900 | val loss: 3.28255892 | val ppl: 26.64 | val time: 2,786.11 ms
-```
 
 - Faster shard-switching (100M tokens/shard) time:
 

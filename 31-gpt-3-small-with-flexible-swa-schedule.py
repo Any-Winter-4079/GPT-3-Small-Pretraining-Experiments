@@ -65,19 +65,28 @@ class GPTConfig:
     use_doc_masking: bool = False
     use_sliding_window_attention: bool = True # True for Sliding Window (local) Attention (e.g., Mistral-style)
     use_sliding_window_size_ramp: bool = True # True to ramp SWA window size up or False for fixed window size
-    use_geometric_updating_step_schedule: bool = False # True to exponentially increase the time a window stays active
-    use_geometric_updating_window_schedule: bool = False # True to exponentially increase the window size
-    sliding_window_size_linear_ramp_steps: int = 1650 # steps over which to linearly increase window size (if use_sliding_window_size_ramp=True and use_geometric_updating_step_schedule=False)
-    sliding_window_size_geometric_schedule_initial_increase_step: int = 100 # e.g., start applying sliding_window_size_geometric_schedule_step_multiplier at this step
-    sliding_window_size_geometric_schedule_step_multiplier: int = 2 # e.g., SWA window size 256 up to step 100, 512 up to 400 (x4), 768 up to 1600 (x4), 1024 up to 6400 (x4), etc. (if enforce_even_blocks, else 128 up to 100, 256 up to 400 (x4), 384 up to 1600 (x4), etc., increasing by flex_block_size)
-    sliding_window_size_geometric_schedule_window_multiplier: int = 2 # e.g., SWA window size 256 up to step 100, 512 (x2) up to 400, 1024 (x2) up to 1600, 2048 (x2) up to 6400, etc. (if enforce_even_blocks, else 128 up to 100, 256 (x2) up to 400, 512 (x2) up to 1600, etc.)
     # window size defines the number of most-recent keys a query can attend to (only used if use_sliding_window_attention=True)
     sliding_window_min_size: int = 128 # sliding window size at the start of training (only used if use_sliding_window_size_ramp=True)
-    sliding_window_max_size: int = 1024 # constant window size (if use_sliding_window_size_ramp=False), or final window size (if use_sliding_window_size_ramp=True)
+    sliding_window_max_size: int = 2048 # constant window size (if use_sliding_window_size_ramp=False), or final window size (if use_sliding_window_size_ramp=True)
     enforce_even_blocks: bool = False # this *can* increase the window past its max to fit even block count
+    # ramp can start and end at steps different than 0 and final step
+    swa_ramp_start_step: int = 200
+    swa_ramp_end_step: int = 10000
+    # window_size = window_size + (m * window_size) + (n * flex_block_size) allows to update:
+    # by additive increments if m=0 and n>0 (e.g., 128, 256, 384, etc., always adding 128 if m=0, n=1)
+    # (exponentially) by larger updates as steps increase if m>0 (e.g., 128, 256, 512, etc., always multiplying by 2 if m=1, n=0)
+    swa_window_coeff_m: float = 0.0
+    swa_window_coeff_n: int = 1
+    # next_update_step = next_update_step + (m * next_update_step) + (n * 1 step) allows to update:
+    # by additive increments if m=0 and n>0 (e.g., 100, 200, 300, etc., adding 100 if n=100)
+    # (exponentially) by larger updates as steps increase if m>0 (e.g., 100, 200, 400, etc., always multiplying by 2 if m=1, n=0)
+    swa_step_coeff_m: float = 0.0
+    swa_step_coeff_n: int = 200
+
     use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
     attn_logit_softcap: float = 15.0
     tanh_backend: str = "ptx" # "clamp", "ptx" (faster) or "rational" or "exact"
+
     use_qk_norm: bool = True
     qk_norm_type: str = "rms" # "rms" or any other name for "l2"
     qk_scale_init: float = 1.0 # init per-head scale
@@ -134,8 +143,8 @@ class TrainingConfig:
     adamw_max_lr: float = 5e-3
     adamw_min_lr_after_lr_warmup_ratio: float = 0.15
     lr_warmup_tokens: int = 0
-    lr_warmup_and_cosine_tokens: int = 800 * 10**6
-    adamw_weight_decay: float = 0.1
+    lr_warmup_and_cosine_tokens: int = 600 * 10**6
+    adamw_weight_decay: float = 0.01
     adamw_hard_min_lr: float = 7e-4
     optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
     muon_lr_scale: float = 0.15 # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
@@ -1033,15 +1042,15 @@ class GPT(nn.Module):
 
         self.use_sliding_window_attention = gpt_config.use_sliding_window_attention
         self.use_sliding_window_size_ramp = gpt_config.use_sliding_window_size_ramp
-        self.use_geometric_updating_step_schedule = gpt_config.use_geometric_updating_step_schedule
-        self.use_geometric_updating_window_schedule = gpt_config.use_geometric_updating_window_schedule
-        self.sliding_window_size_linear_ramp_steps = gpt_config.sliding_window_size_linear_ramp_steps
-        self.sliding_window_size_geometric_schedule_initial_increase_step = gpt_config.sliding_window_size_geometric_schedule_initial_increase_step
-        self.sliding_window_size_geometric_schedule_step_multiplier = gpt_config.sliding_window_size_geometric_schedule_step_multiplier
-        self.sliding_window_size_geometric_schedule_window_multiplier = gpt_config.sliding_window_size_geometric_schedule_window_multiplier
         self.sliding_window_min_size = gpt_config.sliding_window_min_size
         self.sliding_window_max_size = gpt_config.sliding_window_max_size
         self.enforce_even_blocks = gpt_config.enforce_even_blocks
+        self.swa_ramp_start_step = gpt_config.swa_ramp_start_step
+        self.swa_ramp_end_step = gpt_config.swa_ramp_end_step
+        self.swa_window_coeff_m = gpt_config.swa_window_coeff_m
+        self.swa_window_coeff_n = gpt_config.swa_window_coeff_n
+        self.swa_step_coeff_m = gpt_config.swa_step_coeff_m
+        self.swa_step_coeff_n = gpt_config.swa_step_coeff_n
 
         if (self.use_doc_masking or self.use_sliding_window_attention or self.use_attn_logit_softcapping):
             assert self.use_flex_attention, "Document masking / SWA / attention soft-capping require use_flex_attention=True"
@@ -1052,9 +1061,8 @@ class GPT(nn.Module):
                 assert self.sliding_window_min_size > 0, "sliding_window_min_size must be > 0 with use_sliding_window_size_ramp=True"
                 assert self.sliding_window_min_size % self.flex_block_size == 0, "sliding_window_min_size must be a multiple of flex_block_size"
                 assert self.sliding_window_max_size >= self.sliding_window_min_size, "SWA final window size must be >= starting window size if SWA window size ramp up is enabled"
+                assert self.swa_ramp_end_step >= self.swa_ramp_start_step, "SWA ramp final update step must be >= starting update step"
                 self.initial_sliding_window_size = self.sliding_window_min_size
-                if self.use_geometric_updating_window_schedule:
-                    assert self.use_geometric_updating_step_schedule, "SWA geometric window scheduling requires geometric step scheduling"
         else:
             self.initial_sliding_window_size = self.sliding_window_max_size
         # register as a 0-dim tensor buffer so torch.compile treats it as a dynamic tensor input
@@ -1627,22 +1635,17 @@ def get_sliding_window_size(
     sliding_window_max_size: int,
     flex_block_size: int,
     enforce_even_blocks: bool,
-    use_geometric_updating_step_schedule: bool = False,
-    use_geometric_updating_window_schedule: bool = False,
-    sliding_window_size_linear_ramp_steps: int = 1650,
+    swa_ramp_start_step: int,
+    swa_ramp_end_step: int,
+    swa_window_coeff_m: float = 0.0,
+    swa_window_coeff_n: int = 1,
+    swa_step_coeff_m: float = 0.0,
+    swa_step_coeff_n: int = 100,
     current_window_size: int = 128,
-    next_update_step: int = 0,
-    sliding_window_size_geometric_schedule_step_multiplier: int = 4,
-    sliding_window_size_geometric_schedule_window_multiplier: int = 2,
-    sliding_window_size_geometric_schedule_initial_increase_step: int = 100
+    next_update_step: int = 0
     ) -> Tuple[int, int]:
-    if step == 0:
-        assert next_update_step == 0, ("get_sliding_window_size is meant to set its own next_update_step for successive steps, "
-        "not to receive a hardcoded one. If you want that for geometric scheduling, use sliding_window_size_geometric_schedule_initial_increase_step; "
-        "linear scheduling does not support a bias or delayed linear scheduling at the moment")
     # no ramp
-    if not use_sliding_window_size_ramp or sliding_window_size_linear_ramp_steps == 0 or \
-        sliding_window_max_size - sliding_window_min_size == 0:
+    if not use_sliding_window_size_ramp or sliding_window_max_size == sliding_window_min_size:
         # keep size (fast path):
         # the first iteration, it could be snapped to align with flex_block_size or to an even number of blocks;
         # afterwards (step 1 onward), we can safely return
@@ -1652,33 +1655,32 @@ def get_sliding_window_size(
         else:
             # the first step, use sliding_window_max_size to finalize current_window_size
             raw_sliding_window_size = sliding_window_max_size
-        
-    # ramp (keep size until next update step, only then update)
+    # ramp
     else:
-        if not use_geometric_updating_step_schedule:
-            # keep size (fast path)
-            if step < next_update_step:
-                raw_sliding_window_size = current_window_size
-            # update size
-            else:
-                # size increases linearly, but could be snapped to align with flex_block_size or an even number of blocks.
-                t = min(1.0, step / sliding_window_size_linear_ramp_steps)
-                raw_sliding_window_size = round(sliding_window_min_size + t * (sliding_window_max_size - sliding_window_min_size))
-        else:
-            # keep size (fast path)
-            if step < next_update_step:
-                raw_sliding_window_size = current_window_size
-            # update size (except when step 0)
-            elif step > 0:
-                if not use_geometric_updating_window_schedule:
-                    # size increases by flex_block_size (although depending on enforce_even_blocks it could be increased) up to max
-                    raw_sliding_window_size = min(current_window_size + flex_block_size, sliding_window_max_size)
-                else:
-                    # size increases geometrically
-                    raw_sliding_window_size = min(current_window_size * sliding_window_size_geometric_schedule_window_multiplier, sliding_window_max_size)
-            # set step 0 size to sliding_window_min_size
-            else:
-                raw_sliding_window_size = sliding_window_min_size
+        # start at initial size (fast path)
+        if step < swa_ramp_start_step:
+            return sliding_window_min_size, swa_ramp_start_step
+        
+        # if we are at/past ramp steps, skip (future) calculations (fast path)
+        if step >= swa_ramp_end_step or current_window_size >= sliding_window_max_size:
+            return current_window_size, 2**63 - 1
+
+        # keep size (fast path)
+        if step < next_update_step:
+            return current_window_size, next_update_step
+    
+    # ramp update
+    # if we have not returned, an update is triggered
+    if use_sliding_window_size_ramp:
+        # window_size = window_size + (m * window_size) + (n * flex_block_size)
+        raw_sliding_window_size = int(current_window_size + (swa_window_coeff_m * current_window_size) + \
+        (swa_window_coeff_n * flex_block_size))
+        # next_update_step = next_update_step + (m * next_update_step) + (n * 1 step)
+        next_update_step = int(next_update_step + (swa_step_coeff_m * next_update_step) + swa_step_coeff_n)
+
+    # ramp/no ramp update
+    raw_sliding_window_size = max(raw_sliding_window_size, sliding_window_min_size)
+    raw_sliding_window_size = min(raw_sliding_window_size, sliding_window_max_size)
 
     num_blocks_raw = raw_sliding_window_size // flex_block_size
 
@@ -1689,64 +1691,6 @@ def get_sliding_window_size(
         final_num_blocks = num_blocks_raw
         final_size = num_blocks_raw * flex_block_size
 
-    # update next-update step if ramp up (step == next_update_step guards against increasing it until the next update step)
-    if use_sliding_window_size_ramp and step == next_update_step:
-        if not use_geometric_updating_step_schedule:
-            # Target the immediate next block boundary; crossing this triggers the ceil() snap
-            # 128 (Fixed size regardless of enforce_even_blocks) 
-            # Assume:
-            # step = 0
-            # flex_block_size = 128
-            # final_size (from above) = 256 (2x blocks)
-            # enforce_even_blocks = True
-            # sliding_window_min_size = 128
-            # sliding_window_max_size = 896
-            # sliding_window_size_linear_ramp_steps = 1000
-            # 128
-            next_window_size_increment = flex_block_size
-            # 384 = 256 + 128
-            next_sliding_window_trigger_size = final_size + next_window_size_increment
-            # 768 = 896 - 128
-            window_size_range = sliding_window_max_size - sliding_window_min_size
-            # 0.3326822917 = (384 - 0.5 - 128) / 768 = 255.5 / 768
-            t_needed = (next_sliding_window_trigger_size - 0.5 - sliding_window_min_size) / window_size_range
-            # ceil(0.3326822917 * 1000) = ceil(332.6822917) = 333
-            next_update_step = math.ceil(t_needed * sliding_window_size_linear_ramp_steps)
-            #############################################
-            # what happens to step 332 (previous step)? #
-            #############################################
-            # t = min(1.0, step / sliding_window_size_linear_ramp_steps) = min(1.0, 332 / 1000) = 0.332
-            # raw_sliding_window_size = round(sliding_window_min_size + t * (sliding_window_max_size - sliding_window_min_size)) = round(128 + 0.332 * 768) = round(382.976) = 383
-            # num_blocks_raw = raw_sliding_window_size // flex_block_size = 383 // 128 = 2
-            # final_num_blocks = math.ceil(num_blocks_raw / 2) * 2 = 2
-            # final_size = final_num_blocks * flex_block_size = 256
-
-            ###########################################
-            # what happens to step 333 (change step)? #
-            ###########################################
-            # t = min(1.0, step / sliding_window_size_linear_ramp_steps) = min(1.0, 333 / 1000) = 0.333
-            # raw_sliding_window_size = round(sliding_window_min_size + t * (sliding_window_max_size - sliding_window_min_size)) = round(128 + 0.333 * 768) = round(383.744) = 384
-            # num_blocks_raw = raw_sliding_window_size // flex_block_size = 384 // 128 = 3
-            # final_num_blocks = math.ceil(num_blocks_raw / 2) * 2 = 4
-            # final_size = final_num_blocks * flex_block_size = 512
-
-            # if we are at/past ramp steps, skip (future) calculations
-            if next_update_step >= sliding_window_size_linear_ramp_steps:
-                next_update_step = 2**63 - 1
-        else:
-            # when we pass the first increase step (e.g., 100), update it (e.g., x4)
-            if step >= sliding_window_size_geometric_schedule_initial_increase_step:
-                # if we are at/past max size, skip (future) calculations
-                if final_size >= sliding_window_max_size:
-                    next_update_step = 2**63 - 1
-                else:
-                    next_update_step = step * sliding_window_size_geometric_schedule_step_multiplier
-            # if we are at step 0 (because step == next_update_step, 0 == 0, at the beginning), don't check until
-            # we reach sliding_window_size_geometric_schedule_initial_increase_step (e.g., 100)
-            # After the first iteration, this shouldn't execute because when we enter step == next_update_step,
-            # we should have that step >= sliding_window_size_geometric_schedule_initial_increase_step
-            else:
-                next_update_step = sliding_window_size_geometric_schedule_initial_increase_step
     return final_size, next_update_step
 
 ################################################
@@ -2962,14 +2906,14 @@ try:
         sliding_window_max_size = raw_gpt_model.sliding_window_max_size
         flex_block_size = raw_gpt_model.flex_block_size
         enforce_even_blocks = raw_gpt_model.enforce_even_blocks
-        use_geometric_updating_step_schedule = raw_gpt_model.use_geometric_updating_step_schedule
-        use_geometric_updating_window_schedule = raw_gpt_model.use_geometric_updating_window_schedule
-        sliding_window_size_linear_ramp_steps = raw_gpt_model.sliding_window_size_linear_ramp_steps
+        swa_ramp_start_step = raw_gpt_model.swa_ramp_start_step
+        swa_ramp_end_step = raw_gpt_model.swa_ramp_end_step
+        swa_window_coeff_m = raw_gpt_model.swa_window_coeff_m
+        swa_window_coeff_n = raw_gpt_model.swa_window_coeff_n
+        swa_step_coeff_m = raw_gpt_model.swa_step_coeff_m
+        swa_step_coeff_n = raw_gpt_model.swa_step_coeff_n
         current_window_size = raw_gpt_model.initial_sliding_window_size
         next_update_step = 0
-        sliding_window_size_geometric_schedule_step_multiplier = raw_gpt_model.sliding_window_size_geometric_schedule_step_multiplier
-        sliding_window_size_geometric_schedule_window_multiplier = raw_gpt_model.sliding_window_size_geometric_schedule_window_multiplier
-        sliding_window_size_geometric_schedule_initial_increase_step = raw_gpt_model.sliding_window_size_geometric_schedule_initial_increase_step
 
     for step in range(start_step, max_train_steps):
         
@@ -3044,16 +2988,15 @@ try:
                 sliding_window_max_size=sliding_window_max_size,
                 flex_block_size=flex_block_size,
                 enforce_even_blocks=enforce_even_blocks,
-                use_geometric_updating_step_schedule=use_geometric_updating_step_schedule,
-                use_geometric_updating_window_schedule=use_geometric_updating_window_schedule,
-                sliding_window_size_linear_ramp_steps=sliding_window_size_linear_ramp_steps,
+                swa_ramp_start_step=swa_ramp_start_step,
+                swa_ramp_end_step=swa_ramp_end_step,
+                swa_window_coeff_m=swa_window_coeff_m,
+                swa_window_coeff_n=swa_window_coeff_n,
+                swa_step_coeff_m=swa_step_coeff_m,
+                swa_step_coeff_n=swa_step_coeff_n,
                 current_window_size=current_window_size,
-                next_update_step=next_update_step,
-                sliding_window_size_geometric_schedule_step_multiplier=sliding_window_size_geometric_schedule_step_multiplier,
-                sliding_window_size_geometric_schedule_window_multiplier=sliding_window_size_geometric_schedule_window_multiplier,
-                sliding_window_size_geometric_schedule_initial_increase_step=sliding_window_size_geometric_schedule_initial_increase_step
+                next_update_step=next_update_step
             )
-
             # update the buffer in-place to avoid graph breaks
             raw_gpt_model.sliding_window_size.fill_(current_window_size)
 
