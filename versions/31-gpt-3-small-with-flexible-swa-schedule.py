@@ -36,10 +36,10 @@ from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequenc
 @dataclass
 class GPTConfig:
     # miscellaneous
-    n_layers: int = 12
-    d_model: int = 768
+    n_layers: int = 8
+    d_model: int = 1024
     use_bias: bool = False
-    up_proj_factor: int = 4
+    up_proj_factor: int = 2
     use_tied_embeddings: bool = True
     norm_type: str = "rms" # "rms" or any other name for "layer"
     is_causal: bool = True # True for decoders or False for encoders - NOTE: affects sliding_window_max_size! -
@@ -57,8 +57,8 @@ class GPTConfig:
     # q_proj: (d_model → n_heads * head_size)
     # k_proj: (d_model → n_kv_heads * head_size)
     # when d_model is split, the more (q) heads, the smaller the head_size, which is reused for k, v
-    n_heads: int = 12
-    n_kv_heads: int = 12
+    n_heads: int = 16
+    n_kv_heads: int = 16
     use_flex_attention: bool = True # True for FlexAttention or False for SDPA
     flex_block_size: int = 128
     # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
@@ -185,7 +185,7 @@ class TrainingConfig:
     val_tokens: int = 5 * 2**21 # 5 * 2**21 == 10_485_760
     shuffle_val_tokens: bool = True # shuffle or first 10_485_760 tokens of the FineWeb validation shard for the NanoGPT Speedrun
     val_interval: int = 50
-    train_val_margin: float = 0.05 # to save compute, start running validation when training loss + train_val_margin <= val_target
+    train_val_margin: float = 0.075 # to save compute, start running validation when training loss + train_val_margin <= val_target
 
     # sampling
     sample_interval: int = 4000
