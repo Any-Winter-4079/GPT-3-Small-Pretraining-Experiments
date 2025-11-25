@@ -4,8 +4,8 @@ This repo starts coding along [Let's reproduce GPT-2 (124M)](https://www.youtube
 
 ## Measurements
 
-- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens: 5.12 minutes ([config](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_132444/blob/main/config.txt), [log](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_132444/raw/main/log.txt)) (4x NVIDIA H100s -we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
-- [Nov 2, 2025, World record <= 3.28 val loss on _the first_ 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history): 2.345 minutes (8x NVIDIA H100s)
+- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.87 minutes ([config](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_211032/blob/main/config.txt), [log](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_211032/raw/main/log.txt)) (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
+- [Nov 2, 2025, World record <= 3.28 val loss on _the first_ 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
 
 ### WR vs This Repo Differences
 
@@ -183,12 +183,14 @@ and, on another Terminal window (locally, keeping the other SSH session open), s
 
 ```
 scp -P <PORT> -i ~/.ssh/<PRIVATE_KEY_FILE> -r \
-    30-gpt-3-small-with-training-config-and-with-or-without-swa-window-size-ramp.py \
+    versions/30-gpt-3-small-with-training-config-and-with-or-without-swa-window-size-ramp.py \
     input.txt \
     data \
     push_to_hub.py \
     root@<IP>:/workspace/
 ```
+
+Alternatively, use `train.py` for the latest script version.
 
 ## Pre-training
 
@@ -204,7 +206,7 @@ And either create the file (e.g., `30.py` for brevity) or if you already have it
 nano 30.py
 ```
 
-Add `30-gpt-3-small-with-training-config-and-with-or-without-swa-window-size-ramp.py`'s content (from this repo)
+Add `versions/30-gpt-3-small-with-training-config-and-with-or-without-swa-window-size-ramp.py`'s content (from this repo)
 
 Save (e.g., `control + x`, `y`, `enter`)
 
